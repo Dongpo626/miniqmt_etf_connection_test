@@ -1,0 +1,196 @@
+{
+  "resource_name": "etf_price_limit_20pct",
+  "resource_version": "2026-08-04.3",
+  "retrieved_at": "2026-08-04",
+  "rule_mode": "LATEST_SNAPSHOT_WITH_2020_SEED",
+  "default_price_limit_ratio": "0.10",
+  "covered_price_limit_ratio": "0.20",
+  "csv": {
+    "path": "etf_price_limit_20pct.csv",
+    "sha256": "66a22abfc2ab24c17f84d644b90923908ef0d5af5f917be826eddeba518e37f9",
+    "row_count": 231,
+    "columns": [
+      "symbol",
+      "exchange",
+      "price_limit_ratio",
+      "valid_from",
+      "valid_to",
+      "record_mode",
+      "source_id"
+    ],
+    "source_counts": {
+      "SSE_CURRENT_20260804": 145,
+      "SZSE_CURRENT_20260804": 68,
+      "SZSE_CURRENT_20260804_WITH_2020_SEED": 18
+    },
+    "record_mode_counts": {
+      "CURRENT_SNAPSHOT_RULE_INFERENCE": 213,
+      "EFFECTIVE_DATED_OFFICIAL_SEED_CONFIRMED_CURRENT": 17,
+      "SNAPSHOT_DERIVED_REMOVAL_CUTOFF": 1
+    }
+  },
+  "sources": [
+    {
+      "source_id": "SSE_CURRENT_20260804",
+      "authority": "上海证券交易所",
+      "source_type": "OFFICIAL_CURRENT_LIST",
+      "snapshot_date": "2026-08-04",
+      "page_url": "https://etf.sse.com.cn/fundlist/",
+      "data_url": "https://query.sse.com.cn/commonQuery.do?isPagination=false&sqlId=COMMON_JJZWZ_JJLB_L&FUND_CODE=&COMPANY_NAME=&INDEX_NAME=&START_DATE=&END_DATE=&CATEGORY=F000&SUBCLASS=09%2C31%2C15&SWING_TRADE=&type=inParams&FUND_CODE_ASC=1",
+      "request_referer": "https://etf.sse.com.cn/fundlist/",
+      "filter_semantics": "SUBCLASS=09,31,15 is the official 20% price-limit filter exposed by the fund-list page.",
+      "response_utf8_body_size_bytes": 43117,
+      "response_utf8_body_sha256": "b46cc6a12f7f0f559b7833766be286eaac7d00e060abe89f3c59920635f8920b",
+      "official_rows": 153,
+      "official_etf_rows": 146,
+      "included_etf_rows": 145,
+      "excluded_rows": 8,
+      "excluded_lof_rows": 7,
+      "excluded_outside_dataset_scope_rows": 1,
+      "exclusion": "Seven 506xxx LOF rows were excluded because this project supports ETFs only. SH.588530 was excluded because it is absent from the 2026-08-03 QMT dim_etf master used by this project.",
+      "dataset_scope_exclusion": {
+        "symbol": "SH.588530",
+        "qmt_master_snapshot_date": "2026-08-03",
+        "reason": "Absent from qmt_etf_quant.dim_etf; retaining it would create a rule row outside the readable instrument universe."
+      },
+      "valid_from_derivation": "max(2020-08-21 SSE rule publication/effective date, official LISTING_DATE)",
+      "historical_claim": "Current membership is official; inferred starts are not a complete exchange-published membership history."
+    },
+    {
+      "source_id": "SSE_RULE_20200821",
+      "authority": "上海证券交易所",
+      "source_type": "OFFICIAL_RULE_NOTICE",
+      "document_number": "上证发〔2020〕61号",
+      "published_date": "2020-08-21",
+      "url": "https://etf.sse.com.cn/ruleguide/business/c/5287913.shtml",
+      "rule_summary": "Qualifying SSE-listed ETFs and index LOFs use a 20% price-limit ratio from publication."
+    },
+    {
+      "source_id": "SZSE_CURRENT_20260804",
+      "authority": "深圳证券交易所",
+      "source_type": "OFFICIAL_CURRENT_LIST",
+      "snapshot_date": "2026-08-04",
+      "page_url": "https://www.szse.cn/market/fund/list/all/index.html",
+      "data_url_template": "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=1105&TABKEY=tab2&PAGENO={page}",
+      "request_referer": "https://www.szse.cn/market/fund/list/all/index.html",
+      "report_catalog_id": "1105",
+      "report_tab_key": "tab2",
+      "report_name": "20%涨跌幅限制基金列表",
+      "response_pages": [
+        {
+          "page": 1,
+          "body_size_bytes": 18508,
+          "body_sha256": "66a8b959f15300b6ce2429006630409fa5ba5620c0a37ca12afc9dceed5ea09f",
+          "rows": 20
+        },
+        {
+          "page": 2,
+          "body_size_bytes": 18299,
+          "body_sha256": "1db1013e632e112c3d191ad294ba657dd6e08cf457210526e5201b296eda0006",
+          "rows": 20
+        },
+        {
+          "page": 3,
+          "body_size_bytes": 18317,
+          "body_sha256": "a0eaa4193c87783783e36929c6315f55b02e192d16e2f294bb41fcaf6a794b74",
+          "rows": 20
+        },
+        {
+          "page": 4,
+          "body_size_bytes": 18192,
+          "body_sha256": "7f46726acf55a341772ded2f4ff58aff4719175df34cf23040a03881afbe3cbd",
+          "rows": 20
+        },
+        {
+          "page": 5,
+          "body_size_bytes": 15350,
+          "body_sha256": "0e80004278ca3ed9c013d27dec338b5e7889da24e664eb7044a1fb9e7a9cbdf3",
+          "rows": 15
+        }
+      ],
+      "official_rows": 95,
+      "included_etf_rows": 85,
+      "excluded_rows": 10,
+      "exclusion": "Ten LOF rows were excluded because this project supports ETFs only.",
+      "valid_from_derivation": "max(2020-08-24 SZSE rule effective date, official listing date), except seed-confirmed rows use the official seed effective date.",
+      "historical_claim": "Current membership is official; inferred starts are not a complete exchange-published membership history."
+    },
+    {
+      "source_id": "SZSE_SEED_20200824",
+      "authority": "深圳证券交易所",
+      "source_type": "OFFICIAL_EFFECTIVE_DATED_LIST",
+      "published_date": "2020-08-21",
+      "effective_date": "2020-08-24",
+      "url": "https://docs.static.szse.cn/www/aboutus/trends/conference/W020200821767425488573.pdf",
+      "response_size_bytes": 95999,
+      "response_sha256": "ff0a569fede5cb1d4cb09d7aa878c8970fe8c0c74c083beb2b4dfdbe6d71b095",
+      "official_rows": 22,
+      "included_etf_rows": 18,
+      "excluded_rows": 4,
+      "exclusion": "One LOF and three graded-fund B-share rows were excluded because this project supports ETFs only.",
+      "historical_claim": "The 18 ETF codes and 2020-08-24 valid_from are directly supported by the official seed list."
+    },
+    {
+      "source_id": "SZSE_CURRENT_20260804_WITH_2020_SEED",
+      "source_type": "DERIVED_COMBINATION",
+      "component_source_ids": [
+        "SZSE_CURRENT_20260804",
+        "SZSE_SEED_20200824"
+      ],
+      "derivation": "Seventeen seed ETFs remain in the current list. Seed-only SZ.159955 receives a snapshot-derived cutoff because it is absent from both the current 20% list and the current all-funds list."
+    },
+    {
+      "source_id": "SZSE_RULE_FAQ_20201118",
+      "authority": "深圳证券交易所",
+      "source_type": "OFFICIAL_RULE_EXPLANATION",
+      "published_date": "2020-11-18",
+      "url": "https://www.szse.cn/www/investor/knowledge/t20201118_583202.html",
+      "rule_summary": "The exchange explains the qualifying 20% fund categories and points users to its maintained list."
+    }
+  ],
+  "coverage": {
+    "current_snapshot": {
+      "snapshot_date": "2026-08-04",
+      "sse_official_etfs": 146,
+      "sse_included_etfs": 145,
+      "szse_included_etfs": 85,
+      "current_membership_claim": "Both exchange memberships are taken from official current 20% lists. The CSV is complete within the 2026-08-03 QMT dim_etf universe after excluding official SSE symbol SH.588530, which is absent from that master."
+    },
+    "historical_seed": {
+      "effective_date": "2020-08-24",
+      "szse_included_etfs": 18,
+      "confirmed_current": 17,
+      "absent_from_current": 1
+    },
+    "required_test_symbols": {
+      "SH.588000": {
+        "valid_from": "2020-11-16",
+        "source_id": "SSE_CURRENT_20260804",
+        "record_mode": "CURRENT_SNAPSHOT_RULE_INFERENCE"
+      },
+      "SZ.159915": {
+        "valid_from": "2020-08-24",
+        "source_id": "SZSE_CURRENT_20260804_WITH_2020_SEED",
+        "record_mode": "EFFECTIVE_DATED_OFFICIAL_SEED_CONFIRMED_CURRENT"
+      }
+    },
+    "snapshot_derived_cutoff": {
+      "symbol": "SZ.159955",
+      "valid_from": "2020-08-24",
+      "valid_to": "2026-08-03",
+      "record_mode": "SNAPSHOT_DERIVED_REMOVAL_CUTOFF",
+      "evidence": "Official 2020 seed membership plus absence from the 2026-08-04 current 20% list and current all-funds list.",
+      "caveat": "2026-08-03 is a snapshot-derived upper bound, not an exchange-published true removal date."
+    },
+    "known_gap": "Current membership is complete within the 2026-08-03 QMT dim_etf universe for the frozen 2026-08-04 exchange snapshots; official SSE member SH.588530 is intentionally outside that universe. Exact effective-dated additions/removals between the 2020 seed and the snapshot are unavailable. CURRENT_SNAPSHOT_RULE_INFERENCE starts and the SZ.159955 cutoff are approximations, not a legal-grade daily history.",
+    "blank_valid_to_semantics": "The frozen current source did not provide a removal date. Blank means active in the 2026-08-04 snapshot, subject to independent ETF lifecycle checks."
+  },
+  "consumer_requirements": [
+    "Verify the CSV SHA256 before loading.",
+    "Reject duplicate or overlapping symbol effective periods.",
+    "Accept only ratio 0.20 and source_id/record_mode values declared by this manifest.",
+    "Use 0.10 for uncovered ETFs and record the default-path audit event.",
+    "Do not infer membership from a code prefix, fund name, tracking index, or listing date alone at runtime.",
+    "Persist this manifest SHA256 and resource_version in each local run metadata file."
+  ]
+}

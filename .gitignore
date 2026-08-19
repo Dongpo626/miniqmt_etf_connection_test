@@ -1,0 +1,28 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Backtest outputs and local secrets
+runs/
+qmt_example/results/
+.env
+*.local.yaml
+
+# Local archive, IDE and OS files
+main_backtest.7z
+AGENTS.md
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

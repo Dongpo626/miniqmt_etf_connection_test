@@ -1,0 +1,45 @@
+config_version: "1.0"
+
+deployment:
+  deployment_id: "model-example-paper-v1"
+  mode: "PAPER"
+  case: "model"
+  experiment_path: "private_strategy/model_example/experiment.yaml"
+  system_path: "qmt_example/configs/system.yaml"
+  account_id_env: "QMT_PAPER_ACCOUNT_ID"
+  account_type: "STOCK"
+  schedule_anchor_date: 2021-01-04
+
+model:
+  bundle_path: "qmt_example/results/user_experiments/example-run/model_bundle.pt"
+
+miniqmt:
+  userdata_path: "C:/path/to/your/miniqmt/userdata_mini"
+  session_id: 100002
+  reconnect_interval_seconds: 5
+
+signal:
+  run_time: "16:30:00"
+
+execution:
+  policy: "NEAR_CLOSE_LIMIT"
+  submit_start: "14:50:00"
+  stop_new_orders: "14:56:00"
+  cancel_open_orders: "14:57:00"
+  price_offset_ticks: 2
+  quote_stale_seconds: 5
+  lot_size: 100
+  order_type: "FIX_PRICE"
+
+state_database:
+  host: "127.0.0.1"
+  port: 3306
+  database: "qmt_etf_live_state"
+  user: "qmt_live_user"
+  password_env: "QMT_LIVE_MYSQL_PASSWORD"
+
+risk:
+  max_single_order_notional: "200000"
+  max_daily_order_notional: "500000"
+  min_order_notional: "100"
+  max_total_target_weight: "1.0"

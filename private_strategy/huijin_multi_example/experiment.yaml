@@ -1,0 +1,20 @@
+# 本实验仅运行七只 ETF 的 Rule 策略；所有策略参数都在同目录 rule.py 中维护。
+# 数据库、数据快照、费用、滑点、日历和 D+1 执行规则统一来自系统配置。
+name: huijin_multi_etf_mvp
+start_date: 2020-01-01
+end_date: 2026-08-07
+initial_cash: "100000"
+
+case: rule
+
+# 七只交易 ETF 只在此处维护；rule.py 直接读取本次实验解析后的 universe。
+universe:
+  symbols:
+    - SH.510050
+    - SH.510300
+    - SH.510500
+    - SH.512100
+    - SZ.159915
+    - SH.510230
+    - SH.588080
+  pools: []

@@ -1,0 +1,27 @@
+# 这里只填写 Rule 和 Model 共用的回测输入；所有个性参数都写在对应 Python 文件。
+# 数据库、数据快照、费率、滑点、成交量上限、输出目录、SSE 日历、日频、D+1 收盘
+# 成交和 ETF 交易规则由 qmt_example/configs/system.yaml 统一管理。
+name: beginner_example
+start_date: 2024-01-01
+end_date: 2024-12-31
+initial_cash: "1000000"
+
+# 每次只运行一种策略。填写 rule 或 model；需要比较时分别运行两个实验。
+case: rule
+
+# universe 至少填写 symbols 或 pools 之一，也可以同时填写，系统会取并集并去重。
+# symbols 可写 SH.510300、510300.SH 或 510300，系统统一为 SH.######/SZ.######。
+# 当前只接受纯境内股票 ETF 和 518 黄金 ETF；不支持的显式证券会被拒绝。
+# 可用资产池：domestic_stock_etf、gold_etf、all_supported_etf（前两者并集）。
+# 资产池来自本次冻结快照的当前 ETF 主表，再按上市/退市日控制回测期有效性；这不是
+# 完整的历史逐日成分档案，结果属于 RETROSPECTIVE_SNAPSHOT。
+universe:
+  symbols: [SH.510300, SH.518880, SH.588000]
+  pools: []
+  # 只用资产池：把 symbols 改成 []，并使用以下任一写法：
+  # pools: [domestic_stock_etf, gold_etf]
+  # pools: [all_supported_etf]
+  # 也可以同时保留 symbols 和 pools。
+
+# Rule 的回看、调仓、仓位和阈值在 rule.py 的 RuleSettings 中修改。
+# Model 的切分、训练参数和网络构造参数在 model.py 的 MODEL_SETTINGS 中修改。

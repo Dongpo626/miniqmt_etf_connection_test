@@ -1,0 +1,68 @@
+# 所有用户共用这份系统配置结构。每位用户通常只需修改 MySQL 连接信息；
+# 数据表、快照、交易费用和输出规则由项目维护者统一确定。
+database:
+  # MySQL 服务器 IP 或域名。
+  host: 127.0.0.1
+  # MySQL 服务端口，默认 3306。
+  port: 3306
+  # 保存 QMT ETF 日频数据的数据库名。
+  database: qmt_etf_quant
+  # 改成你自己的 MySQL 只读账号。
+  user: qmt_readonly
+  # 密码环境变量名；运行前给它赋值。内部环境也可改用 password: "密码"。
+  password_env: QMT_MYSQL_PASSWORD
+  # 连接字符集，不建议修改。
+  charset: utf8mb4
+  # 建立连接最多等待的秒数。
+  connect_timeout_seconds: 10
+
+data_snapshot:
+  # 本次回测数据快照标识，会写入 run.json。
+  dataset_version: qmt_etf_quant_20260812
+  # 数据快照业务日期。
+  snapshot_date: 2026-08-12
+  # 统一快照开始生成的 UTC 时间。
+  snapshot_started_at_utc: 2026-08-12T08:48:57Z
+  # 主数据包清单 SHA-256，用于标记输入版本。
+  manifest_sha256: 39502872c5544cbf4dc1671ea67488479021e39db97f34aecdedf1bc56cc62a7
+  # 原始未复权日线表；成交、估值和账户记账使用它。
+  raw_table: etf_quote_qmt_unadjusted_daily
+  # 前复权日线表；只提供给 Rule/Model 计算信号和特征。
+  front_table: etf_quote_qmt_front_ratio_daily
+  # ETF 每日份额表；Rule 的 share_on/share_history 从这里读取。
+  share_table: etf_share_daily
+  # 汇金持有人合并文件。不使用时将本项和下一项同时设为 null。
+  huijin_holders_csv: resources/huijin/huijin_combined.csv
+  # 上述汇金 CSV 的 SHA-256。
+  huijin_holders_csv_sha256: 62b2f7141b4a0e7c9666880906dc7d2e0a6c8d2d71f87949834f2b0a6d4d0ad1
+  # Rule 可读取的指数日线表。
+  index_table: index_quote_daily
+  # 每日停牌及涨跌停状态表，与其他表同属 qmt_etf_quant 快照。
+  trade_status_table: etf_trade_status_daily
+  # 从指数表加载并允许 Rule 读取的指数代码。
+  rule_index_codes: [000001.SH]
+  # 统一冻结快照；不宣称逐日 PIT。
+  data_mode: RETROSPECTIVE_SNAPSHOT
+
+# 20% 涨跌幅证券规则及版本清单，路径相对于项目根目录。
+limit_rules_csv: resources/limit_rules/etf_price_limit_20pct.csv
+limit_rules_manifest: resources/limit_rules/manifest.json
+# 沪深 ETF 统一由冻结的上交所交易日历推进。
+calendar_policy: SSE_FOR_ALL
+
+fee:
+  # 每笔成交佣金率。
+  commission_rate: "0.0003"
+  # 每笔最低佣金，单位为元。
+  minimum_commission: "5"
+  # ETF 印花税率。
+  stamp_duty_rate: "0"
+
+slippage:
+  # 相对原始收盘价的不利方向滑点率。
+  rate: "0.0005"
+
+# 单笔订单最多使用当日成交量的比例。
+volume_participation_rate: "0.20"
+# 每次运行的新结果目录会创建在该项目相对路径下。
+runs_dir: qmt_example/results/user_experiments
