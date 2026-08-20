@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from etf_backtest.experiments.config import safe_relative_path
 
@@ -71,6 +71,10 @@ class SignalConfig(_LiveModel):
     run_time: time
 
 
+class EodConfig(_LiveModel):
+    run_time: time = time(15, 10)
+
+
 class ExecutionConfig(_LiveModel):
     policy: Literal["NEAR_CLOSE_LIMIT"]
     submit_start: time
@@ -103,7 +107,9 @@ class LiveStateDatabaseConfig(_LiveModel):
     def _validate_database(self) -> Self:
         if not 1 <= self.port <= 65535:
             raise ValueError("state database port must be between 1 and 65535")
-        if not all(value.strip() for value in (self.host, self.database, self.user, self.password_env)):
+        if not all(
+            value.strip() for value in (self.host, self.database, self.user, self.password_env)
+        ):
             raise ValueError("state database text fields must not be blank")
         return self
 
@@ -159,6 +165,7 @@ class LiveConfig(_LiveModel):
     miniqmt: MiniQmtConfig
     signal: SignalConfig
     execution: ExecutionConfig
+    eod: EodConfig = Field(default_factory=EodConfig)
     state_database: LiveStateDatabaseConfig
     risk: LiveRiskConfig
     model: ModelLiveConfig | None = None
@@ -169,6 +176,17 @@ class LiveConfig(_LiveModel):
             raise ValueError("Rule live configuration must not contain model")
         if self.deployment.case == "model" and self.model is None:
             raise ValueError("Model live configuration requires model.bundle_path")
+        if not (
+            self.execution.submit_start
+            < self.execution.stop_new_orders
+            < self.execution.cancel_open_orders
+            < self.eod.run_time
+            < self.signal.run_time
+        ):
+            raise ValueError(
+                "live times must satisfy submit_start < stop_new_orders < "
+                "cancel_open_orders < eod.run_time < signal.run_time"
+            )
         return self
 
     @property
@@ -197,4 +215,10 @@ def load_live_config(path: Path) -> LiveConfig:
     return LiveConfig.model_validate(payload)
 
 
-__all__ = ["LiveConfig", "LiveStateDatabaseConfig", "ModelLiveConfig", "load_live_config"]
+__all__ = [
+    "EodConfig",
+    "LiveConfig",
+    "LiveStateDatabaseConfig",
+    "ModelLiveConfig",
+    "load_live_config",
+]

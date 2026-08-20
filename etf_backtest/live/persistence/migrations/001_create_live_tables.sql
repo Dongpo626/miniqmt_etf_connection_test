@@ -28,7 +28,7 @@ CREATE TABLE live_job_run (
     job_type VARCHAR(64) NOT NULL,
     trade_date DATE NOT NULL,
     trigger_source ENUM('SCHEDULED', 'MANUAL', 'RECOVERY') NOT NULL,
-    status ENUM('RUNNING', 'SUCCEEDED', 'FAILED') NOT NULL,
+    status ENUM('RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED') NOT NULL,
     started_at DATETIME(6) NOT NULL,
     finished_at DATETIME(6) NULL,
     error_type VARCHAR(128) NULL,
@@ -74,7 +74,10 @@ CREATE TABLE live_order_intent (
     limit_price DECIMAL(24, 8) NOT NULL,
     intent_key CHAR(64) NOT NULL,
     remark_token VARCHAR(24) NOT NULL,
-    status ENUM('PLANNED', 'SUBMITTING', 'SUBMITTED', 'SUBMIT_UNKNOWN', 'REJECTED') NOT NULL,
+    status ENUM(
+        'PLANNED', 'SUBMITTING', 'SUBMITTED', 'SUBMIT_UNKNOWN',
+        'COMPLETED', 'INCOMPLETE', 'ABANDONED', 'REJECTED'
+    ) NOT NULL,
     reject_reason TEXT NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
@@ -93,7 +96,9 @@ CREATE TABLE live_broker_order (
     requested_quantity BIGINT NOT NULL,
     filled_quantity BIGINT NOT NULL,
     average_fill_price DECIMAL(24, 8) NULL,
-    status ENUM('PENDING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'REJECTED') NOT NULL,
+    status ENUM(
+        'PENDING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'REJECTED', 'UNKNOWN'
+    ) NOT NULL,
     remark_token VARCHAR(24) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
     CONSTRAINT uq_live_broker_order_account_id UNIQUE (account_id, broker_order_id),
@@ -119,7 +124,7 @@ CREATE TABLE live_broker_trade (
 CREATE TABLE live_account_snapshot (
     deployment_id VARCHAR(64) NOT NULL,
     trade_date DATE NOT NULL,
-    snapshot_type ENUM('EOD') NOT NULL,
+    snapshot_type ENUM('CURRENT', 'EOD') NOT NULL,
     captured_at DATETIME(6) NOT NULL,
     cash DECIMAL(24, 8) NOT NULL,
     available_cash DECIMAL(24, 8) NOT NULL,
@@ -134,7 +139,7 @@ CREATE TABLE live_account_snapshot (
 CREATE TABLE live_position_snapshot (
     deployment_id VARCHAR(64) NOT NULL,
     trade_date DATE NOT NULL,
-    snapshot_type ENUM('EOD') NOT NULL,
+    snapshot_type ENUM('CURRENT', 'EOD') NOT NULL,
     symbol VARCHAR(16) NOT NULL,
     total_quantity BIGINT NOT NULL,
     available_quantity BIGINT NOT NULL,

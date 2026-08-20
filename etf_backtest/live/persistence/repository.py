@@ -10,7 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, insert, select, text, update
+from sqlalchemy import and_, delete, insert, or_, select, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.sql.base import Executable
@@ -101,9 +101,7 @@ class LiveStateRepository:
         self._engine = engine
 
     @contextmanager
-    def _connection(
-        self, connection: Connection | None, *, write: bool
-    ) -> Iterator[Connection]:
+    def _connection(self, connection: Connection | None, *, write: bool) -> Iterator[Connection]:
         if connection is not None:
             yield connection
             return
@@ -141,9 +139,7 @@ class LiveStateRepository:
             )
         return run_id
 
-    def finish_job_run(
-        self, job_run_id: str, *, connection: Connection | None = None
-    ) -> None:
+    def finish_job_run(self, job_run_id: str, *, connection: Connection | None = None) -> None:
         with self._connection(connection, write=True) as active:
             active.execute(
                 update(live_job_run)
@@ -171,15 +167,90 @@ class LiveStateRepository:
                 )
             )
 
+    def skip_job_run(
+        self,
+        job_run_id: str,
+        *,
+        reason: str,
+        connection: Connection | None = None,
+    ) -> None:
+        with self._connection(connection, write=True) as active:
+            active.execute(
+                update(live_job_run)
+                .where(live_job_run.c.job_run_id == job_run_id)
+                .values(
+                    status=JobStatus.SKIPPED,
+                    finished_at=_now(),
+                    error_type="SKIP_REASON",
+                    error_message=reason,
+                )
+            )
+
+    def has_succeeded_job(
+        self,
+        deployment_id: str,
+        job_type: str,
+        trade_date: date,
+        *,
+        connection: Connection | None = None,
+    ) -> bool:
+        with self._connection(connection, write=False) as active:
+            row = _one(
+                active,
+                select(live_job_run.c.job_run_id)
+                .where(
+                    live_job_run.c.deployment_id == deployment_id,
+                    live_job_run.c.job_type == job_type,
+                    live_job_run.c.trade_date == trade_date,
+                    live_job_run.c.status == JobStatus.SUCCEEDED,
+                )
+                .limit(1),
+            )
+        return row is not None
+
+    def has_terminal_job(
+        self,
+        deployment_id: str,
+        job_type: str,
+        trade_date: date,
+        *,
+        connection: Connection | None = None,
+    ) -> bool:
+        with self._connection(connection, write=False) as active:
+            row = _one(
+                active,
+                select(live_job_run.c.job_run_id)
+                .where(
+                    live_job_run.c.deployment_id == deployment_id,
+                    live_job_run.c.job_type == job_type,
+                    live_job_run.c.trade_date == trade_date,
+                    or_(
+                        live_job_run.c.status == JobStatus.SUCCEEDED,
+                        and_(
+                            live_job_run.c.status == JobStatus.SKIPPED,
+                            ~live_job_run.c.error_message.like("FUTURE_%"),
+                            live_job_run.c.error_message.not_in(
+                                (
+                                    "SIGNAL_TIME_NOT_REACHED",
+                                    "REBALANCE_TIME_NOT_REACHED",
+                                    "CANCEL_TIME_NOT_REACHED",
+                                    "EOD_TIME_NOT_REACHED",
+                                )
+                            ),
+                        ),
+                    ),
+                )
+                .limit(1),
+            )
+        return row is not None
+
     def get_deployment(
         self, deployment_id: str, *, connection: Connection | None = None
     ) -> StateRow | None:
         with self._connection(connection, write=False) as active:
             return _one(
                 active,
-                select(live_deployment).where(
-                    live_deployment.c.deployment_id == deployment_id
-                ),
+                select(live_deployment).where(live_deployment.c.deployment_id == deployment_id),
             )
 
     def get_active_deployment_for_account(
@@ -237,9 +308,7 @@ class LiveStateRepository:
                     name for name, value in immutable.items() if existing.get(name) != value
                 ]
                 if mismatched:
-                    raise ValueError(
-                        "deployment immutable fields differ: " + ", ".join(mismatched)
-                    )
+                    raise ValueError("deployment immutable fields differ: " + ", ".join(mismatched))
                 if existing["status"] == DeploymentStatus.RETIRED:
                     raise ValueError("RETIRED deployment cannot be reactivated")
                 if existing["status"] == DeploymentStatus.PAUSED:
@@ -260,10 +329,7 @@ class LiveStateRepository:
             ):
                 active.execute(
                     update(live_deployment)
-                    .where(
-                        live_deployment.c.deployment_id
-                        == active_for_account["deployment_id"]
-                    )
+                    .where(live_deployment.c.deployment_id == active_for_account["deployment_id"])
                     .values(status=DeploymentStatus.RETIRED)
                 )
             if existing is None:
@@ -318,9 +384,7 @@ class LiveStateRepository:
     def current_unresolved(
         self, deployment_id: str, *, connection: Connection | None = None
     ) -> tuple[StateRow, ...]:
-        return self.list_unresolved_intents(
-            deployment_id=deployment_id, connection=connection
-        )
+        return self.list_unresolved_intents(deployment_id=deployment_id, connection=connection)
 
     def create_or_get_decision(
         self,
@@ -376,9 +440,7 @@ class LiveStateRepository:
         *,
         connection: Connection | None = None,
     ) -> None:
-        canonical = {
-            normalize_symbol(symbol): weight for symbol, weight in target_weights.items()
-        }
+        canonical = {normalize_symbol(symbol): weight for symbol, weight in target_weights.items()}
         with self._connection(connection, write=True) as active:
             rows = _many(
                 active,
@@ -435,9 +497,7 @@ class LiveStateRepository:
         with self._connection(connection, write=False) as active:
             return _many(
                 active,
-                select(live_order_intent).where(
-                    live_order_intent.c.decision_id == decision_id
-                ),
+                select(live_order_intent).where(live_order_intent.c.decision_id == decision_id),
             )
 
     def create_order_intent(
@@ -461,9 +521,7 @@ class LiveStateRepository:
                 if any(existing[name] != value for name, value in expected.items()):
                     raise ValueError("existing intent_key has different economic content")
                 return existing
-            token_owner = self.get_intent_by_remark_token(
-                intent.remark_token, connection=active
-            )
+            token_owner = self.get_intent_by_remark_token(intent.remark_token, connection=active)
             if token_owner is not None:
                 raise ValueError("remark_token is already bound to another intent")
             identifier = intent_id or uuid.uuid4().hex
@@ -494,9 +552,7 @@ class LiveStateRepository:
         with self._connection(connection, write=False) as active:
             return _one(
                 active,
-                select(live_order_intent).where(
-                    live_order_intent.c.intent_key == intent_key
-                ),
+                select(live_order_intent).where(live_order_intent.c.intent_key == intent_key),
             )
 
     def get_intent_by_remark_token(
@@ -551,6 +607,89 @@ class LiveStateRepository:
             connection=connection,
             reject_reason=reason,
         )
+
+    def mark_intent_completed(
+        self, intent_id: str, *, connection: Connection | None = None
+    ) -> None:
+        self._set_intent_status(intent_id, OrderIntentStatus.COMPLETED, connection=connection)
+
+    def mark_intent_incomplete(
+        self,
+        intent_id: str,
+        reason: str,
+        *,
+        connection: Connection | None = None,
+    ) -> None:
+        self._set_intent_status(
+            intent_id,
+            OrderIntentStatus.INCOMPLETE,
+            connection=connection,
+            reject_reason=reason,
+        )
+
+    def abandon_planned_intents(
+        self,
+        deployment_id: str,
+        *,
+        connection: Connection | None = None,
+    ) -> tuple[StateRow, ...]:
+        with self._connection(connection, write=True) as active:
+            rows = _many(
+                active,
+                select(live_order_intent)
+                .join(live_decision)
+                .where(
+                    live_decision.c.deployment_id == deployment_id,
+                    live_order_intent.c.status == OrderIntentStatus.PLANNED,
+                ),
+            )
+            if rows:
+                intent_ids = tuple(str(row["intent_id"]) for row in rows)
+                active.execute(
+                    update(live_order_intent)
+                    .where(live_order_intent.c.intent_id.in_(intent_ids))
+                    .values(
+                        status=OrderIntentStatus.ABANDONED,
+                        reject_reason="ABANDONED_STALE_INTENT",
+                        updated_at=_now(),
+                    )
+                )
+            return rows
+
+    def decision_has_intent_status(
+        self,
+        decision_id: str,
+        status: OrderIntentStatus,
+        *,
+        connection: Connection | None = None,
+    ) -> bool:
+        with self._connection(connection, write=False) as active:
+            row = _one(
+                active,
+                select(live_order_intent.c.intent_id)
+                .where(
+                    live_order_intent.c.decision_id == decision_id,
+                    live_order_intent.c.status == status,
+                )
+                .limit(1),
+            )
+        return row is not None
+
+    def list_order_intents(
+        self,
+        *,
+        deployment_id: str | None = None,
+        statuses: Sequence[OrderIntentStatus] | None = None,
+        connection: Connection | None = None,
+    ) -> tuple[StateRow, ...]:
+        statement = select(live_order_intent, live_decision.c.deployment_id).join(live_decision)
+        if deployment_id is not None:
+            statement = statement.where(live_decision.c.deployment_id == deployment_id)
+        if statuses:
+            statement = statement.where(live_order_intent.c.status.in_(tuple(statuses)))
+        statement = statement.order_by(live_order_intent.c.updated_at.desc())
+        with self._connection(connection, write=False) as active:
+            return _many(active, statement)
 
     def _set_intent_status(
         self,
@@ -608,9 +747,7 @@ class LiveStateRepository:
                 order=order,
                 connection=active,
             )
-            self._set_intent_status(
-                intent_id, OrderIntentStatus.SUBMITTED, connection=active
-            )
+            self._set_intent_status(intent_id, OrderIntentStatus.SUBMITTED, connection=active)
 
     def upsert_broker_order(
         self,
@@ -703,9 +840,7 @@ class LiveStateRepository:
         with self._connection(connection, write=False) as active:
             return _many(
                 active,
-                select(live_broker_order).where(
-                    live_broker_order.c.intent_id == intent_id
-                ),
+                select(live_broker_order).where(live_broker_order.c.intent_id == intent_id),
             )
 
     def get_intent(
@@ -725,9 +860,7 @@ class LiveStateRepository:
         with self._connection(connection, write=False) as active:
             return _many(
                 active,
-                select(live_broker_trade).where(
-                    live_broker_trade.c.intent_id == intent_id
-                ),
+                select(live_broker_trade).where(live_broker_trade.c.intent_id == intent_id),
             )
 
     def save_account_snapshot(
@@ -804,9 +937,7 @@ class LiveStateRepository:
         trade_date: date | None = None,
         connection: Connection | None = None,
     ) -> tuple[StateRow, ...]:
-        statement = select(live_job_run).where(
-            live_job_run.c.deployment_id == deployment_id
-        )
+        statement = select(live_job_run).where(live_job_run.c.deployment_id == deployment_id)
         if trade_date is not None:
             statement = statement.where(live_job_run.c.trade_date == trade_date)
         statement = statement.order_by(live_job_run.c.started_at.desc())
@@ -826,14 +957,21 @@ class LiveStateRepository:
             )
 
     def latest_account_snapshot(
-        self, deployment_id: str, *, connection: Connection | None = None
+        self,
+        deployment_id: str,
+        snapshot_type: SnapshotType,
+        *,
+        connection: Connection | None = None,
     ) -> StateRow | None:
         with self._connection(connection, write=False) as active:
             return _one(
                 active,
                 select(live_account_snapshot)
-                .where(live_account_snapshot.c.deployment_id == deployment_id)
-                .order_by(live_account_snapshot.c.trade_date.desc())
+                .where(
+                    live_account_snapshot.c.deployment_id == deployment_id,
+                    live_account_snapshot.c.snapshot_type == snapshot_type,
+                )
+                .order_by(live_account_snapshot.c.captured_at.desc())
                 .limit(1),
             )
 

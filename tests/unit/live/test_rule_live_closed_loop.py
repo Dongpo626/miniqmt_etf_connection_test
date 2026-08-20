@@ -32,6 +32,10 @@ class _ClosedLoopRepository:
         self.intent = {
             "intent_id": "intent-1",
             "remark_token": intent.remark_token,
+            "symbol": intent.symbol,
+            "side": intent.side,
+            "requested_quantity": intent.requested_quantity,
+            "limit_price": intent.limit_price,
             "status": OrderIntentStatus.PLANNED,
         }
         self.order: dict[str, Any] | None = None
@@ -56,6 +60,22 @@ class _ClosedLoopRepository:
         connection: object = None,
     ) -> dict[str, Any] | None:
         return self.intent if self.intent["remark_token"] == remark_token else None
+
+    def get_intent(self, intent_id: str, *, connection: object = None) -> dict[str, Any] | None:
+        del connection
+        return self.intent if self.intent["intent_id"] == intent_id else None
+
+    def mark_intent_completed(self, intent_id: str, *, connection: object = None) -> None:
+        del connection
+        assert self.intent["intent_id"] == intent_id
+        self.intent["status"] = OrderIntentStatus.COMPLETED
+
+    def mark_intent_incomplete(
+        self, intent_id: str, reason: str, *, connection: object = None
+    ) -> None:
+        del reason, connection
+        assert self.intent["intent_id"] == intent_id
+        self.intent["status"] = OrderIntentStatus.INCOMPLETE
 
     def bind_broker_order(
         self,
@@ -195,4 +215,4 @@ def test_minimal_rule_target_to_trade_reconcile_and_snapshot_closed_loop() -> No
         symbols=("510300.SH",),
     )
     assert snapshot.positions_by_symbol["SH.510300"].total_quantity == 500
-    assert repository.intent["status"] is OrderIntentStatus.SUBMITTED
+    assert repository.intent["status"] is OrderIntentStatus.COMPLETED

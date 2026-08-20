@@ -22,6 +22,9 @@ class OrderIntentStatus(StrEnum):
     SUBMITTING = "SUBMITTING"
     SUBMITTED = "SUBMITTED"
     SUBMIT_UNKNOWN = "SUBMIT_UNKNOWN"
+    COMPLETED = "COMPLETED"
+    INCOMPLETE = "INCOMPLETE"
+    ABANDONED = "ABANDONED"
     REJECTED = "REJECTED"
 
 
@@ -48,6 +51,7 @@ class JobStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 class JobTriggerSource(StrEnum):
@@ -57,6 +61,7 @@ class JobTriggerSource(StrEnum):
 
 
 class SnapshotType(StrEnum):
+    CURRENT = "CURRENT"
     EOD = "EOD"
 
 
@@ -208,6 +213,12 @@ class ReconciliationReport:
     matched_order_count: int
     inserted_trade_count: int
     unresolved_intent_ids: tuple[str, ...] = ()
+    active_broker_order_ids: tuple[str, ...] = ()
+    incomplete_intent_ids: tuple[str, ...] = ()
+    order_trade_mismatch_ids: tuple[str, ...] = ()
+    order_identity_mismatch_ids: tuple[str, ...] = ()
+    trade_identity_mismatch_ids: tuple[str, ...] = ()
+    unknown_order_status_ids: tuple[str, ...] = ()
     unknown_broker_order_ids: tuple[str, ...] = ()
     unknown_broker_trade_ids: tuple[str, ...] = ()
 
@@ -215,9 +226,17 @@ class ReconciliationReport:
     def has_unresolved(self) -> bool:
         return bool(
             self.unresolved_intent_ids
+            or self.order_trade_mismatch_ids
+            or self.order_identity_mismatch_ids
+            or self.trade_identity_mismatch_ids
+            or self.unknown_order_status_ids
             or self.unknown_broker_order_ids
             or self.unknown_broker_trade_ids
         )
+
+    @property
+    def has_incomplete(self) -> bool:
+        return bool(self.incomplete_intent_ids)
 
 
 __all__ = [

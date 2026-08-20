@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import cast
 from unittest.mock import Mock
@@ -5,12 +6,15 @@ from unittest.mock import Mock
 import pytest
 from sqlalchemy.engine import Connection, Engine
 
+import etf_backtest.live_cli as live_cli
 from etf_backtest.live.broker.base import BrokerGateway
+from etf_backtest.live.config import load_live_config
 from etf_backtest.live.engine import LiveTradingEngine
 from etf_backtest.live.jobs import LiveDailyJobs
 from etf_backtest.live.market.base import QuoteProvider
 from etf_backtest.live.persistence.repository import LiveStateRepository
 from etf_backtest.live.scheduler import LiveScheduler
+from etf_backtest.live.state import SnapshotType
 from etf_backtest.live_cli import LiveCommandRuntime, main
 
 ROOT = Path(__file__).parents[3]
@@ -94,3 +98,30 @@ def test_db_init_dispatch_does_not_build_external_runtime(
 def test_validate_works_without_external_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("etf_backtest.live_cli._validate", lambda config: None)
     assert main(["validate", "--config", str(CONFIG)]) == 0
+
+
+def test_status_reads_current_and_eod_snapshots_separately(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("QMT_PAPER_ACCOUNT_ID", "account-1")
+    config = load_live_config(CONFIG)
+    engine = Mock(spec=Engine)
+    repository = Mock(spec=LiveStateRepository)
+    repository.get_deployment.return_value = {"deployment_id": "deployment-1"}
+    repository.latest_decision_for_deployment.return_value = None
+    repository.latest_account_snapshot.side_effect = [
+        {
+            "trade_date": "2026-08-19",
+            "snapshot_type": SnapshotType.CURRENT,
+        },
+        {"trade_date": "2026-08-19", "snapshot_type": SnapshotType.EOD},
+    ]
+    repository.load_position_snapshots.return_value = ()
+    monkeypatch.setattr(live_cli, "_read_repository", lambda config: (engine, repository))
+
+    live_cli._print_status(config)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload["snapshots"]) == {"CURRENT", "EOD"}
+    assert repository.latest_account_snapshot.call_args_list[0].args[1] is SnapshotType.CURRENT
+    assert repository.latest_account_snapshot.call_args_list[1].args[1] is SnapshotType.EOD

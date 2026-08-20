@@ -4,11 +4,18 @@ from pathlib import Path
 from sqlalchemy import UniqueConstraint
 
 from etf_backtest.live.persistence.schema import LIVE_TABLES, metadata
+from etf_backtest.live.state import (
+    BrokerOrderStatus,
+    JobStatus,
+    OrderIntentStatus,
+    SnapshotType,
+)
 
 MIGRATION = (
     Path(__file__).parents[4]
     / "etf_backtest/live/persistence/migrations/001_create_live_tables.sql"
 )
+RECOVERY_MIGRATION = MIGRATION.with_name("002_live_recovery_states.sql")
 
 
 def _unique_columns(table_name: str) -> set[tuple[str, ...]]:
@@ -40,6 +47,17 @@ def test_schema_contains_only_nine_core_tables_and_required_unique_keys() -> Non
     assert ("remark_token",) in _unique_columns("live_order_intent")
     assert ("account_id", "broker_order_id") in _unique_columns("live_broker_order")
     assert ("account_id", "broker_trade_id") in _unique_columns("live_broker_trade")
+    assert (
+        "deployment_id",
+        "trade_date",
+        "snapshot_type",
+    ) in _unique_columns("live_account_snapshot")
+    assert (
+        "deployment_id",
+        "trade_date",
+        "snapshot_type",
+        "symbol",
+    ) in _unique_columns("live_position_snapshot")
     assert not metadata.tables["live_job_run"].foreign_keys
 
 
@@ -58,3 +76,38 @@ def test_migration_has_same_nine_tables_and_schema_columns() -> None:
         assert {column.name for column in table.columns} <= set(
             re.findall(r"^\s*(\w+)\s+", block, flags=re.MULTILINE)
         )
+
+
+def test_manual_recovery_migration_contains_only_required_enum_extensions() -> None:
+    sql_001 = MIGRATION.read_text(encoding="utf-8")
+    sql_002 = RECOVERY_MIGRATION.read_text(encoding="utf-8")
+    assert "CREATE TABLE" not in sql_002.upper()
+    expected = {
+        ("live_job_run", "status"): tuple(member.value for member in JobStatus),
+        ("live_order_intent", "status"): tuple(member.value for member in OrderIntentStatus),
+        ("live_broker_order", "status"): tuple(member.value for member in BrokerOrderStatus),
+        ("live_account_snapshot", "snapshot_type"): tuple(member.value for member in SnapshotType),
+        ("live_position_snapshot", "snapshot_type"): tuple(member.value for member in SnapshotType),
+    }
+    for (table_name, column_name), values in expected.items():
+        table_block = re.search(
+            rf"CREATE TABLE\s+{table_name}\s*\((.*?)\)\s*ENGINE=",
+            sql_001,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert table_block is not None
+        enum_001 = re.search(
+            rf"\b{column_name}\s+ENUM\((.*?)\)\s+NOT NULL",
+            table_block.group(1),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        enum_002 = re.search(
+            rf"ALTER TABLE\s+{table_name}\s+MODIFY COLUMN\s+{column_name}\s+"
+            r"ENUM\((.*?)\)\s+NOT NULL",
+            sql_002,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert enum_001 is not None and enum_002 is not None
+        assert tuple(re.findall(r"'([^']+)'", enum_001.group(1))) == values
+        assert tuple(re.findall(r"'([^']+)'", enum_002.group(1))) == values
+        assert tuple(metadata.tables[table_name].c[column_name].type.enums) == values

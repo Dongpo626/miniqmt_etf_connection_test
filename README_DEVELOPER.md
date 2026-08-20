@@ -67,8 +67,13 @@
 - Model bundle 外部计算 SHA-256，并与 immutable deployment 的 path/hash/model_id 绑定；
 - 信号事务使用冻结 Universe，只读取截至信号日 D 的行情历史；
 - Broker、行情、账户、Planner、Risk、Reconciliation、Jobs 和 Scheduler 由 Rule/Model 共用；
-- 支持启动对账、信号准备、目标执行、停止新单、撤单、日终对账与账户快照；
-- 支持 MiniQMT 回调消费、幂等 intent/remark 身份以及账户锁和 Job 锁；
+- Scheduler 只编排 `prepare_signal`、`rebalance`、`eod` 三个配置驱动业务 Job；
+- `rebalance` 内部完成单批规划、提交、有限轮询、到时撤单和最终查询核对，重启时从本地意图与
+  MiniQMT 事实恢复，已有意图不重新规划或提交；
+- Broker 回调只幂等保存事实并设置异常事件，Engine 主循环统一停止 Scheduler、重连、启动对账
+  并恢复 Scheduler；
+- `CURRENT` 只在启动恢复、rebalance 结束和 EOD 更新；EOD 将同一批成功查询事实分别写入
+  `CURRENT` 与 `EOD`；
 - Model PAPER 进程内复用一次加载的模型，不每日训练、不拟合 scaler、不自动切换 bundle。
 
 ### 交易、账户与输出
@@ -237,7 +242,7 @@ state_dict 和 portfolio；模型失败时 Job 失败，不保存新 target，�
 | `live.persistence` | 九张状态表、锁和幂等状态读写 | 写入策略数据库 |
 | `live.execution` / `live.risk` | 单批订单规划、定价和风险检查 | 自动补单、持续追单 |
 | `live.reconciliation` | Broker 与本地订单/成交一致性检查 | 自动猜测或覆盖不明状态 |
-| `live.scheduler` / `live.engine` | 自动时间表、生命周期和安全停止 | 第二套业务 Job |
+| `live.scheduler` / `live.engine` | 三 Job 时间表、主循环生命周期、断线重连和安全停止 | 第二套业务 Job、回调线程内重连 |
 
 ## 7. Rule 与 Model 的区别
 
@@ -304,7 +309,8 @@ Rule 个性参数只写在 `rule.py/RuleSettings`；Model 个性参数只写在
 
 - deployment ID、Rule/Model case、experiment/system 路径和调度锚点；
 - MiniQMT userdata、session ID 和账户环境变量名；
-- 信号、提交、停止新单和撤单时间；
+- 信号、提交、停止新单、撤单和 EOD 时间，顺序固定为
+  `submit_start < stop_new_orders < cancel_open_orders < eod.run_time < signal.run_time`；
 - 独立 Live 状态数据库及密码环境变量名；
 - 风险上限；
 - Model 情况下唯一固定的 bundle 路径。

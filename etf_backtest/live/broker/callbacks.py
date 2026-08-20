@@ -57,9 +57,7 @@ def enqueue_trade(events: Queue[BrokerEvent], trade: BrokerTradeSnapshot) -> Non
     events.put(BrokerEvent(BrokerEventType.TRADE, payload=trade, account_id=trade.account_id))
 
 
-def enqueue_error(
-    events: Queue[BrokerEvent], event_type: BrokerEventType, error: object
-) -> None:
+def enqueue_error(events: Queue[BrokerEvent], event_type: BrokerEventType, error: object) -> None:
     events.put(
         BrokerEvent(
             event_type,
@@ -145,6 +143,7 @@ class BrokerEventConsumer:
             return
         if event.event_type in {BrokerEventType.ORDER_ERROR, BrokerEventType.CANCEL_ERROR}:
             LOGGER.error("MiniQMT %s: %s", event.event_type, event.error)
+            self._on_unhealthy()
             return
         if event.event_type is BrokerEventType.ORDER:
             self._persist_order(event.payload)
@@ -161,6 +160,7 @@ class BrokerEventConsumer:
                 self.process(event)
             except Exception:
                 LOGGER.exception("failed to consume MiniQMT callback event")
+                self._on_unhealthy()
 
     def _persist_order(self, payload: object | None) -> None:
         if not isinstance(payload, BrokerOrderSnapshot):

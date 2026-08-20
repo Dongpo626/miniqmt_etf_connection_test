@@ -17,6 +17,8 @@ from etf_backtest.live.config import LiveConfig, load_live_config
 from etf_backtest.live.jobs import (
     DeploymentSpec,
     DeploymentSpecFactory,
+    JobAlreadySucceeded,
+    JobSkipped,
     LiveDailyJobs,
     SignalEvaluator,
 )
@@ -35,6 +37,7 @@ from etf_backtest.live.state import (
     OrderIntentStatus,
     QueryResult,
     ReconciliationReport,
+    SnapshotType,
     SubmitOrderResult,
     SubmitOrderStatus,
 )
@@ -110,10 +113,8 @@ def test_startup_queries_and_reconciles_before_ensure_and_query_failure_stops(
 ) -> None:
     events: list[str] = []
     repository = Mock(spec=LiveStateRepository)
-    repository.get_deployment.side_effect = lambda *args, **kwargs: _record(
-        events, "read", None
-    )
-    repository.get_active_deployment_for_account.return_value = None
+    repository.get_deployment.side_effect = lambda *args, **kwargs: _record(events, "read", None)
+    repository.transaction.return_value = nullcontext(Mock(spec=Connection))
     repository.ensure_deployment.side_effect = lambda **kwargs: _record(
         events, "ensure", _deployment()
     )
@@ -123,8 +124,8 @@ def test_startup_queries_and_reconciles_before_ensure_and_query_failure_stops(
         original = method.return_value
         method.side_effect = lambda result=original, label=name: _record(events, label, result)
     reconciliation = Mock(spec=ReconciliationService)
-    reconciliation.reconcile.side_effect = (
-        lambda **kwargs: _record(events, "reconcile", ReconciliationReport(0, 0))
+    reconciliation.reconcile.side_effect = lambda **kwargs: _record(
+        events, "reconcile", ReconciliationReport(0, 0)
     )
     spec = DeploymentSpec(
         deployment_id="beginner-example-paper-v1",
@@ -165,7 +166,7 @@ def test_startup_resumes_paused_only_after_safe_reconciliation(
     repository = Mock(spec=LiveStateRepository)
     paused = _deployment(DeploymentStatus.PAUSED)
     repository.get_deployment.side_effect = [paused, _deployment()]
-    repository.get_active_deployment_for_account.return_value = None
+    repository.transaction.return_value = nullcontext(Mock(spec=Connection))
     repository.ensure_deployment.return_value = paused
     broker = _broker()
     reconciliation = Mock(spec=ReconciliationService)
@@ -197,7 +198,44 @@ def test_startup_resumes_paused_only_after_safe_reconciliation(
     reconciliation.reconcile.assert_called_once()
     factory.assert_called_once_with(("SH.510300", "SH.518880"))
     repository.ensure_deployment.assert_called_once()
+    repository.abandon_planned_intents.assert_called_once_with("beginner-example-paper-v1")
     repository.resume_deployment.assert_called_once_with("beginner-example-paper-v1")
+
+
+def test_abandoned_stale_intent_skips_without_planning_or_second_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Mock(spec=LiveStateRepository)
+    repository.get_deployment.return_value = _deployment()
+    repository.pending_decision_for_date.return_value = {"decision_id": "decision-1"}
+    repository.decision_has_intent_status.return_value = True
+    broker = _broker()
+    jobs = _jobs(monkeypatch, repository, broker)
+
+    with pytest.raises(JobSkipped, match="ABANDONED_STALE_INTENT"):
+        jobs._execute_pending_target(date(2026, 8, 19))
+
+    repository.load_target_positions.assert_not_called()
+    repository.create_order_intent.assert_not_called()
+    broker.submit_order.assert_not_called()
+
+
+def test_manual_jobs_cannot_bypass_date_or_time_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Mock(spec=LiveStateRepository)
+    broker = _broker()
+    jobs = _jobs(monkeypatch, repository, broker)
+
+    with pytest.raises(JobSkipped, match="STALE_SIGNAL_DATE"):
+        jobs._prepare_signal(date(2026, 8, 18))
+    with pytest.raises(JobSkipped, match="CANCEL_TIME_NOT_REACHED"):
+        jobs._cancel_open_orders_for_date(date(2026, 8, 19))
+    with pytest.raises(JobSkipped, match="EOD_TIME_NOT_REACHED"):
+        jobs._eod(date(2026, 8, 19))
+
+    repository.get_deployment.assert_not_called()
+    broker.query_orders.assert_not_called()
 
 
 def test_prepare_signal_saves_complete_zero_target_after_evaluation(
@@ -219,6 +257,7 @@ def test_prepare_signal_saves_complete_zero_target_after_evaluation(
         target_portfolio=TargetPortfolio({}),
     )
     jobs = _jobs(monkeypatch, repository, broker, evaluator=evaluator)
+    jobs.clock = lambda: datetime(2026, 8, 19, 16, 30, tzinfo=MARKET_TIMEZONE)
 
     jobs._prepare_signal(date(2026, 8, 19))
 
@@ -238,12 +277,18 @@ def test_execute_submits_once_and_maps_three_submit_results(
     repository.get_deployment.return_value = _deployment()
     repository.current_unresolved.return_value = ()
     repository.pending_decision_for_date.return_value = {"decision_id": "decision-1"}
+    repository.decision_has_intent_status.return_value = False
+    planned = {"intent_id": "intent-1", "status": OrderIntentStatus.PLANNED}
+    submitted = {"intent_id": "intent-1", "status": OrderIntentStatus.SUBMITTED}
+    repository.list_order_intents_for_decision.side_effect = [
+        (),
+        (submitted,),
+    ]
+    repository.transaction.return_value = nullcontext(Mock(spec=Connection))
     repository.load_target_positions.return_value = {
         "SH.510300": Decimal("0.5"),
         "SH.518880": Decimal("0"),
     }
-    planned = {"intent_id": "intent-1", "status": OrderIntentStatus.PLANNED}
-    submitted = {"intent_id": "intent-1", "status": OrderIntentStatus.SUBMITTED}
     repository.create_order_intent.side_effect = [planned, submitted]
     repository.get_intent.return_value = submitted
     broker = _broker()
@@ -279,17 +324,16 @@ def test_execute_submits_once_and_maps_three_submit_results(
     repository.bind_broker_order.assert_called_once()
     intent = cast(OrderIntent, broker.submit_order.call_args.args[0])
 
-    repository.create_order_intent.side_effect = None
+    repository.list_order_intents_for_decision.side_effect = None
     for existing_status in (
         OrderIntentStatus.SUBMITTING,
         OrderIntentStatus.SUBMIT_UNKNOWN,
         OrderIntentStatus.SUBMITTED,
         OrderIntentStatus.REJECTED,
     ):
-        repository.create_order_intent.return_value = {
-            "intent_id": "intent-1",
-            "status": existing_status,
-        }
+        repository.list_order_intents_for_decision.return_value = (
+            {"intent_id": "intent-1", "status": existing_status},
+        )
         broker.submit_order.reset_mock()
         jobs._execute_pending_target(date(2026, 8, 19))
         broker.submit_order.assert_not_called()
@@ -303,6 +347,74 @@ def test_execute_submits_once_and_maps_three_submit_results(
         broker.submit_order.return_value = SubmitOrderResult(status, error="result")
         jobs._submit_intent(intent, "another-intent", "account-1")
         method.assert_called_once()
+
+
+def test_recovery_with_submitted_order_resumes_cancel_and_final_check_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Mock(spec=LiveStateRepository)
+    deployment = _deployment()
+    repository.get_deployment.return_value = deployment
+    repository.pending_decision_for_date.return_value = {"decision_id": "decision-1"}
+    repository.decision_has_intent_status.return_value = False
+    intent = {
+        "intent_id": "intent-1",
+        "decision_id": "decision-1",
+        "status": OrderIntentStatus.SUBMITTED,
+        "deployment_id": deployment["deployment_id"],
+    }
+    repository.list_order_intents_for_decision.return_value = (intent,)
+    repository.get_broker_order.return_value = {"intent_id": "intent-1"}
+    repository.get_intent.return_value = intent
+    repository.transaction.return_value = nullcontext(Mock(spec=Connection))
+    active = BrokerOrderSnapshot(
+        broker_order_id="broker-1",
+        symbol="510300.SH",
+        side=OrderSide.BUY,
+        requested_quantity=100,
+        filled_quantity=0,
+        limit_price=Decimal("10"),
+        status=BrokerOrderStatus.PENDING,
+        captured_at=NOW,
+        remark_token="L" + "R" * 20,
+    )
+    canceled = BrokerOrderSnapshot(
+        broker_order_id="broker-1",
+        symbol="510300.SH",
+        side=OrderSide.BUY,
+        requested_quantity=100,
+        filled_quantity=0,
+        limit_price=Decimal("10"),
+        status=BrokerOrderStatus.CANCELED,
+        captured_at=NOW,
+        remark_token="L" + "R" * 20,
+    )
+    broker = _broker()
+    broker.query_orders.side_effect = [
+        QueryResult(success=True, records=(active,)),
+        QueryResult(success=True, records=(active,)),
+        QueryResult(success=True, records=(canceled,)),
+        QueryResult(success=True, records=(canceled,)),
+    ]
+    reconciliation = Mock(spec=ReconciliationService)
+    reconciliation.reconcile.side_effect = [
+        ReconciliationReport(1, 0, active_broker_order_ids=("broker-1",)),
+        ReconciliationReport(1, 0, incomplete_intent_ids=("intent-1",)),
+        ReconciliationReport(1, 0, incomplete_intent_ids=("intent-1",)),
+    ]
+    jobs = _jobs(monkeypatch, repository, broker, reconciliation=reconciliation)
+    jobs.clock = lambda: datetime(2026, 8, 19, 15, 0, tzinfo=MARKET_TIMEZONE)
+
+    result = jobs._execute_pending_target(date(2026, 8, 19))
+
+    assert result == (intent,)
+    repository.create_order_intent.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_called_once_with("broker-1")
+    repository.save_account_snapshot.assert_called_once()
+    assert (
+        repository.save_account_snapshot.call_args.kwargs["snapshot_type"] is SnapshotType.CURRENT
+    )
 
 
 def test_unknown_cancel_pauses_without_cancel_and_snapshot_keeps_zero_symbol(
@@ -330,14 +442,20 @@ def test_unknown_cancel_pauses_without_cancel_and_snapshot_keeps_zero_symbol(
             ),
         ),
     )
-    jobs = _jobs(monkeypatch, repository, broker)
+    reconciliation = Mock(spec=ReconciliationService)
+    reconciliation.reconcile.return_value = ReconciliationReport(0, 0)
+    jobs = _jobs(monkeypatch, repository, broker, reconciliation=reconciliation)
     with pytest.raises(RuntimeError, match="unknown active"):
         jobs._cancel_open_orders()
     broker.cancel_order.assert_not_called()
     repository.pause_deployment.assert_called_once()
 
     broker.query_orders.return_value = QueryResult[BrokerOrderSnapshot](success=True)
+    jobs.clock = lambda: datetime(2026, 8, 19, 15, 10, tzinfo=MARKET_TIMEZONE)
     jobs._snapshot_eod(date(2026, 8, 19))
+    assert [
+        call.kwargs["snapshot_type"] for call in repository.save_account_snapshot.call_args_list
+    ] == [SnapshotType.CURRENT, SnapshotType.EOD]
     rows = repository.save_position_snapshots.call_args.kwargs["positions"]
     assert [row["symbol"] for row in rows] == ["SH.510300", "SH.518880"]
     assert all(row["total_quantity"] == 0 for row in rows)
@@ -351,6 +469,7 @@ def test_reconcile_eod_pauses_for_query_failure_or_current_unresolved_only(
     broker = _broker()
     reconciliation = Mock(spec=ReconciliationService)
     jobs = _jobs(monkeypatch, repository, broker, reconciliation=reconciliation)
+    jobs.clock = lambda: datetime(2026, 8, 19, 15, 10, tzinfo=MARKET_TIMEZONE)
 
     broker.query_orders.return_value = QueryResult(success=False, error="offline")
     with pytest.raises(RuntimeError, match="orders query failed"):
@@ -365,9 +484,7 @@ def test_reconcile_eod_pauses_for_query_failure_or_current_unresolved_only(
     )
     with pytest.raises(RuntimeError, match="unresolved"):
         jobs._reconcile_eod()
-    repository.pause_deployment.assert_called_with(
-        "beginner-example-paper-v1", "EOD_UNRESOLVED"
-    )
+    repository.pause_deployment.assert_called_with("beginner-example-paper-v1", "EOD_UNRESOLVED")
 
     reconciliation.reconcile.return_value = ReconciliationReport(0, 0)
     pause_count = repository.pause_deployment.call_count
@@ -397,3 +514,26 @@ def test_job_lock_failure_marks_run_failed_without_body(
         )
     body.assert_not_called()
     repository.fail_job_run.assert_called_once()
+
+
+def test_persisted_terminal_job_prevents_manual_or_recovery_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Mock(spec=LiveStateRepository)
+    repository.has_terminal_job.return_value = True
+    jobs = _jobs(monkeypatch, repository, _broker())
+    connection = Mock(spec=Connection)
+    jobs.state_engine.connect.return_value = nullcontext(connection)  # type: ignore[attr-defined]
+    monkeypatch.setattr("etf_backtest.live.jobs.acquire_job_lock", lambda *args: True)
+    monkeypatch.setattr("etf_backtest.live.jobs.release_job_lock", lambda *args: None)
+
+    with pytest.raises(JobAlreadySucceeded, match="already completed"):
+        jobs._run_job(
+            "rebalance",
+            date(2026, 8, 19),
+            JobTriggerSource.MANUAL,
+            Mock(),
+            None,
+        )
+
+    repository.start_job_run.assert_not_called()

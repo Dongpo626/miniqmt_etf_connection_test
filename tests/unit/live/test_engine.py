@@ -116,3 +116,26 @@ def test_successful_lifecycle_order_and_startup_failure_cleanup(
     scheduler2.start.assert_not_called()
     broker2.disconnect.assert_called_once()
     connection2.close.assert_called_once()
+
+
+def test_callback_only_sets_event_and_main_loop_performs_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, broker, quotes, jobs, scheduler = _engine(monkeypatch)
+    monkeypatch.setattr("etf_backtest.live.engine.acquire_account_lock", lambda *args: True)
+    monkeypatch.setattr("etf_backtest.live.engine.release_account_lock", lambda *args: None)
+
+    engine.start(date(2026, 8, 19))
+    engine.notify_broker_unhealthy()
+    scheduler.stop.assert_not_called()
+    broker.disconnect.assert_not_called()
+
+    engine._recover_broker()
+
+    scheduler.stop.assert_called_once()
+    assert scheduler.start.call_count == 2
+    assert broker.connect.call_count == 2
+    assert broker.disconnect.call_count == 1
+    assert jobs.startup_reconcile.call_count == 2
+    assert quotes.subscribe.call_count == 2
+    engine.stop()

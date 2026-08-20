@@ -22,12 +22,15 @@ from etf_backtest.live.state import (
     DeploymentStatus,
     JobTriggerSource,
     OrderIntent,
+    SnapshotType,
 )
 
 NOW = datetime(2026, 8, 19, 15, 5, tzinfo=MARKET_TIMEZONE)
 
 
-def _result(*, first: dict[str, object] | None = None, rows: list[dict[str, object]] | None = None) -> Mock:
+def _result(
+    *, first: dict[str, object] | None = None, rows: list[dict[str, object]] | None = None
+) -> Mock:
     result = Mock()
     mapping = result.mappings.return_value
     mapping.first.return_value = first
@@ -105,9 +108,9 @@ def test_duplicate_intent_is_returned_only_when_economic_content_matches() -> No
     connection.execute.return_value = _result(first=existing)
     repository, _ = _repository(connection)
 
-    assert repository.create_order_intent(
-        intent, connection=cast(Connection, connection)
-    ) == existing
+    assert (
+        repository.create_order_intent(intent, connection=cast(Connection, connection)) == existing
+    )
     with pytest.raises(ValueError, match="different economic content"):
         repository.create_order_intent(
             _intent(quantity=200), connection=cast(Connection, connection)
@@ -123,9 +126,7 @@ def test_remark_collision_fails_without_retry_or_insert() -> None:
     repository, _ = _repository(connection)
 
     with pytest.raises(ValueError, match="remark_token"):
-        repository.create_order_intent(
-            _intent(), connection=cast(Connection, connection)
-        )
+        repository.create_order_intent(_intent(), connection=cast(Connection, connection))
     assert connection.execute.call_count == 2
 
 
@@ -230,14 +231,18 @@ def test_retired_is_terminal_and_paused_is_not_implicitly_reactivated() -> None:
     repository, _ = _repository(connection)
     with pytest.raises(ValueError, match="RETIRED"):
         repository.ensure_deployment(
-            deployment_id="deployment-1", mode="PAPER", **immutable  # type: ignore[arg-type]
+            deployment_id="deployment-1",
+            mode="PAPER",
+            **immutable,  # type: ignore[arg-type]
         )
 
     paused = {"deployment_id": "deployment-1", "status": DeploymentStatus.PAUSED, **immutable}
     connection.reset_mock()
     connection.execute.side_effect = [_result(first=paused)]
     ensured = repository.ensure_deployment(
-        deployment_id="deployment-1", mode="PAPER", **immutable  # type: ignore[arg-type]
+        deployment_id="deployment-1",
+        mode="PAPER",
+        **immutable,  # type: ignore[arg-type]
     )
     assert ensured["status"] is DeploymentStatus.PAUSED
     assert connection.execute.call_count == 1
@@ -279,3 +284,22 @@ def test_release_and_job_lock_use_their_matching_lock_names() -> None:
     assert params[0] == params[1]
     assert params[2] == params[3]
     assert params[0] != params[2]
+
+
+def test_latest_current_and_eod_snapshots_are_queried_separately_by_capture_time() -> None:
+    connection = Mock(spec=Connection)
+    connection.execute.side_effect = [
+        _result(first={"snapshot_type": SnapshotType.CURRENT}),
+        _result(first={"snapshot_type": SnapshotType.EOD}),
+    ]
+    repository, _ = _repository(connection)
+
+    current = repository.latest_account_snapshot("deployment-1", SnapshotType.CURRENT)
+    eod = repository.latest_account_snapshot("deployment-1", SnapshotType.EOD)
+
+    assert current == {"snapshot_type": SnapshotType.CURRENT}
+    assert eod == {"snapshot_type": SnapshotType.EOD}
+    statements = [call.args[0] for call in connection.execute.call_args_list]
+    assert SnapshotType.CURRENT in statements[0].compile().params.values()
+    assert SnapshotType.EOD in statements[1].compile().params.values()
+    assert all("captured_at DESC" in str(statement) for statement in statements)

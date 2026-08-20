@@ -9,13 +9,17 @@ ROOT = Path(__file__).parents[3]
 SAMPLE = ROOT / "qmt_example/configs/live/beginner_example_paper.yaml"
 
 
-def test_rule_paper_config_and_hash_are_stable_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rule_paper_config_and_hash_are_stable_and_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("QMT_LIVE_MYSQL_PASSWORD", "secret-one")
     first = load_live_config(SAMPLE)
     monkeypatch.setenv("QMT_LIVE_MYSQL_PASSWORD", "secret-two")
     second = load_live_config(SAMPLE)
 
     assert first.deployment.case == "rule" and first.deployment.mode == "PAPER"
+    assert first.eod.run_time.isoformat() == "15:10:00"
+    assert not hasattr(first.execution, "rebalance_time")
     assert first.config_hash == second.config_hash
     assert "secret" not in first.config_hash
 
@@ -34,6 +38,13 @@ def test_model_section_and_invalid_time_order_are_rejected(tmp_path: Path) -> No
     invalid_time.write_text(yaml.safe_dump(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="submit_start"):
         load_live_config(invalid_time)
+
+    payload = yaml.safe_load(SAMPLE.read_text(encoding="utf-8"))
+    payload["eod"]["run_time"] = "16:31:00"
+    invalid_eod = tmp_path / "eod.yaml"
+    invalid_eod.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"eod\.run_time"):
+        load_live_config(invalid_eod)
 
 
 def test_only_named_secret_environment_fields_are_resolved(monkeypatch: pytest.MonkeyPatch) -> None:

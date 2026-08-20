@@ -52,13 +52,13 @@ from etf_backtest.live.persistence.repository import (
 from etf_backtest.live.reconciliation import ReconciliationService
 from etf_backtest.live.risk import LiveRiskManager
 from etf_backtest.live.scheduler import LiveScheduler
+from etf_backtest.live.state import SnapshotType
 from etf_backtest.strategy.model_runtime import DailyModelStrategy
 from etf_backtest.strategy.model_training import load_daily_torch_bundle_for_inference
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = (
-    Path(__file__).resolve().parent
-    / "live/persistence/migrations/001_create_live_tables.sql"
+    Path(__file__).resolve().parent / "live/persistence/migrations/001_create_live_tables.sql"
 )
 
 
@@ -204,19 +204,7 @@ def build_production_runtime(
     scheduler = LiveScheduler(
         jobs=jobs,
         calendar=_StrategyTradingDaySource(calendar_repository),
-    )
-
-    def on_unhealthy() -> None:
-        scheduler.stop()
-        disable = getattr(broker, "disable_trading", None)
-        if callable(disable):
-            disable()
-
-    consumer = BrokerEventConsumer(
-        events=events,
-        repository=repository,
-        account_id=account_id,
-        on_unhealthy=on_unhealthy,
+        config=config,
     )
     engine = LiveTradingEngine(
         config=config,
@@ -226,8 +214,14 @@ def build_production_runtime(
         quote_provider=quote_provider,
         jobs=jobs,
         scheduler=scheduler,
-        event_consumer=consumer,
     )
+    consumer = BrokerEventConsumer(
+        events=events,
+        repository=repository,
+        account_id=account_id,
+        on_unhealthy=engine.notify_broker_unhealthy,
+    )
+    engine.set_event_consumer(consumer)
     return LiveCommandRuntime(
         state_engine=state_engine,
         repository=repository,
@@ -243,7 +237,17 @@ def build_production_runtime(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qmt-etf-live")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "db", "service", "signal", "execute", "cancel", "snapshot", "jobs", "status"):
+    for name in (
+        "validate",
+        "db",
+        "service",
+        "signal",
+        "execute",
+        "cancel",
+        "snapshot",
+        "jobs",
+        "status",
+    ):
         command = subcommands.add_parser(name)
         if name == "db":
             command.add_argument("action", choices=("init",))
@@ -323,14 +327,20 @@ def _print_status(config: LiveConfig) -> None:
                 intent_id = str(intent["intent_id"])
                 orders.extend(repository.list_broker_orders_for_intent(intent_id))
                 trades.extend(repository.list_broker_trades_for_intent(intent_id))
-        account = repository.latest_account_snapshot(deployment_id)
-        positions: tuple[dict[str, object], ...] = ()
-        if account is not None:
-            positions = repository.load_position_snapshots(
-                deployment_id,
-                account["trade_date"],
-                account["snapshot_type"],
-            )
+        snapshots: dict[str, object] = {}
+        for snapshot_type in (SnapshotType.CURRENT, SnapshotType.EOD):
+            account = repository.latest_account_snapshot(deployment_id, snapshot_type)
+            positions: tuple[dict[str, object], ...] = ()
+            if account is not None:
+                positions = repository.load_position_snapshots(
+                    deployment_id,
+                    account["trade_date"],
+                    snapshot_type,
+                )
+            snapshots[snapshot_type.value] = {
+                "account": account,
+                "positions": positions,
+            }
         print(
             json.dumps(
                 {
@@ -340,8 +350,7 @@ def _print_status(config: LiveConfig) -> None:
                     "intents": intents,
                     "broker_orders": orders,
                     "broker_trades": trades,
-                    "account_snapshot": account,
-                    "position_snapshots": positions,
+                    "snapshots": snapshots,
                 },
                 ensure_ascii=False,
                 default=str,
@@ -369,11 +378,9 @@ def _manual_job(runtime: LiveCommandRuntime, config: LiveConfig, args: argparse.
         runtime.broker.subscribe_account(account_id)
         trade_date = _date(getattr(args, "date", None))
         if args.command == "execute":
-            deployment = runtime.repository.get_deployment(
-                config.deployment.deployment_id
-            )
-            if deployment is None:
-                raise RuntimeError("deployment does not exist; run startup reconcile first")
+            # This is the same recovery boundary as service startup. In particular,
+            # stale PLANNED intents are abandoned before manual execution is considered.
+            deployment = runtime.jobs.startup_reconcile(trade_date, lock_connection=connection)
             symbols = json.loads(str(deployment["universe_json"]))
             if not isinstance(symbols, list):
                 raise ValueError("deployment universe_json is invalid")
@@ -416,11 +423,7 @@ def main(
     args = _parser().parse_args(argv)
     try:
         config = load_live_config(Path(args.config))
-        if (
-            args.command == "reconcile"
-            and args.phase == "eod"
-            and args.date is None
-        ):
+        if args.command == "reconcile" and args.phase == "eod" and args.date is None:
             raise ValueError("reconcile --phase eod requires --date")
         if args.command == "validate":
             _validate(config)
@@ -433,11 +436,7 @@ def main(
         else:
             runtime = (runtime_builder or build_production_runtime)(config)
             if args.command == "service":
-                try:
-                    runtime.engine.start(datetime.now().date())
-                    runtime.scheduler.run_forever()
-                finally:
-                    runtime.engine.stop()
+                runtime.engine.run_forever()
             else:
                 _manual_job(runtime, config, args)
         return 0

@@ -265,7 +265,9 @@ Model 运行还会保存 `model_bundle.pt` 和 `predictions.csv`。失败运行�
 - MiniQMT 资产、持仓、订单和成交查询；
 - xtdata 行情订阅和内部对象映射；
 - 固定 Universe、deployment 不可变校验和账户/Job 锁；
-- 启动对账、单日信号、订单规划、风险检查、提交、撤单、回调和日终快照；
+- 启动恢复、成交状态同步、订单规划、有限轮询/撤单、最终核对和日终双快照；
+- Scheduler 仅包含 `prepare_signal`、`rebalance`、`eod` 三个配置驱动业务 Job；
+- Broker 断线由 Engine 主循环停止 Scheduler、重连、对账并恢复 Scheduler；
 - Rule source 或固定 Model bundle 通过同一个 `DailyDecisionService` 生成每日决策；
 - 手工命令与自动 Scheduler 共用同一组 Jobs。
 
@@ -294,7 +296,8 @@ qmt_example/configs/live/model_example_paper.yaml
 - `miniqmt.userdata_path` 与唯一正整数 `session_id`；
 - PAPER 账户和两个数据库的环境变量；
 - Model 情况下由当前代码重新训练生成的 V2 `model_bundle.pt` 路径；
-- 风险上限和固定的信号、提交、停止新单、撤单时间。
+- 风险上限和固定的信号、提交、停止新单、撤单、日终时间。时间必须满足
+  `submit_start < stop_new_orders < cancel_open_orders < eod.run_time < signal.run_time`。
 
 Model bundle 与 deployment 是不可变绑定。更换 bundle 必须更换 `deployment_id` 和 live YAML，
 不能在运行中的同一个 deployment 内热切换。
@@ -316,6 +319,9 @@ qmt-etf-live validate --config qmt_example/configs/live/beginner_example_paper.y
 qmt-etf-live db init --config qmt_example/configs/live/beginner_example_paper.yaml
 ```
 
+已有 V2 状态库升级时，停止服务后由运维人员手工执行
+`etf_backtest/live/persistence/migrations/002_live_recovery_states.sql`；服务不会自动执行该迁移。
+
 常用手工命令：
 
 ```powershell
@@ -335,6 +341,9 @@ qmt-etf-live status --config $liveConfig
 ```powershell
 qmt-etf-live service --config $liveConfig
 ```
+
+`status` 只读取状态库，并分别显示按 `captured_at` 选出的最新 `CURRENT` 与 `EOD` 快照；
+它不会实时连接 MiniQMT。`CURRENT` 只在启动恢复、rebalance 最终核对、EOD 三个节点更新。
 
 `service` 不是首次真实验收入口。推荐顺序是：数据库 migration 和锁检查 → Rule 只读启动 →
 Rule 手工完整闭环 → Rule 自动完整日流程 → Model bundle 只读加载 → Model 手工完整闭环 →

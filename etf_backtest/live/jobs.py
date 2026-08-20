@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import time as time_module
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -69,6 +70,14 @@ from etf_backtest.strategy.model_runtime import DailyModelStrategy
 from etf_backtest.strategy.model_training import LoadedInferenceBundle, bundle_sha256
 
 ResultT = TypeVar("ResultT")
+
+
+class JobAlreadySucceeded(RuntimeError):
+    """Signal that one persisted daily job is already terminal."""
+
+
+class JobSkipped(RuntimeError):
+    """Signal a deliberate safe skip that must not be retried as a failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,9 +287,7 @@ class RuleSignalService:
                 connection=connection,
             )
             calendar = runtime.portal.trading_calendar
-            self._schedule_resolver.previous_trading_day(
-                calendar=calendar, trade_date=signal_date
-            )
+            self._schedule_resolver.previous_trading_day(calendar=calendar, trade_date=signal_date)
             execution_date = self._schedule_resolver.next_trading_day(
                 calendar=calendar, trade_date=signal_date
             )
@@ -393,6 +400,7 @@ class LiveDailyJobs:
         price_policy: NearCloseLimitPolicy | None = None,
         reconciliation_service: ReconciliationService | None = None,
         clock: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.config = config
         self.broker = broker
@@ -406,6 +414,7 @@ class LiveDailyJobs:
         self.price_policy = price_policy or NearCloseLimitPolicy()
         self.reconciliation = reconciliation_service or ReconciliationService()
         self.clock = clock or (lambda: datetime.now(MARKET_TIMEZONE))
+        self.sleep = sleep or time_module.sleep
 
     def _run_job(
         self,
@@ -414,13 +423,9 @@ class LiveDailyJobs:
         trigger_source: JobTriggerSource,
         body: Callable[[], ResultT],
         lock_connection: Connection | None,
+        *,
+        deduplicate: bool = True,
     ) -> ResultT:
-        run_id = self.repository.start_job_run(
-            deployment_id=self.config.deployment.deployment_id,
-            job_type=job_type,
-            trade_date=trade_date,
-            trigger_source=trigger_source,
-        )
         manager = (
             self.state_engine.connect()
             if lock_connection is None
@@ -432,12 +437,38 @@ class LiveDailyJobs:
             )
             if not acquired:
                 error = RuntimeError(f"job lock is already held: {job_type}")
+                run_id = self.repository.start_job_run(
+                    deployment_id=self.config.deployment.deployment_id,
+                    job_type=job_type,
+                    trade_date=trade_date,
+                    trigger_source=trigger_source,
+                )
                 self.repository.fail_job_run(
                     run_id, error_type=type(error).__name__, error_message=str(error)
                 )
                 raise error
+            run_id = ""
             try:
+                if deduplicate and self.repository.has_terminal_job(
+                    self.config.deployment.deployment_id,
+                    job_type,
+                    trade_date,
+                ):
+                    raise JobAlreadySucceeded(
+                        f"job already completed: {job_type} {trade_date.isoformat()}"
+                    )
+                run_id = self.repository.start_job_run(
+                    deployment_id=self.config.deployment.deployment_id,
+                    job_type=job_type,
+                    trade_date=trade_date,
+                    trigger_source=trigger_source,
+                )
                 result = body()
+            except JobAlreadySucceeded:
+                raise
+            except JobSkipped as error:
+                self.repository.skip_job_run(run_id, reason=str(error))
+                raise
             except Exception as error:
                 self.repository.fail_job_run(
                     run_id,
@@ -449,9 +480,40 @@ class LiveDailyJobs:
                 self.repository.finish_job_run(run_id)
                 return result
             finally:
-                release_job_lock(
-                    lock, self.config.deployment.deployment_id, job_type, trade_date
-                )
+                release_job_lock(lock, self.config.deployment.deployment_id, job_type, trade_date)
+
+    def has_job_completed(self, job_type: str, trade_date: date) -> bool:
+        return self.repository.has_terminal_job(
+            self.config.deployment.deployment_id, job_type, trade_date
+        )
+
+    def record_job_skipped(self, job_type: str, trade_date: date, reason: str) -> None:
+        def skip() -> None:
+            raise JobSkipped(reason)
+
+        try:
+            self._run_job(
+                job_type,
+                trade_date,
+                JobTriggerSource.RECOVERY,
+                skip,
+                None,
+            )
+        except (JobAlreadySucceeded, JobSkipped):
+            return
+
+    def has_rebalance_activity(self, execution_date: date) -> bool:
+        """Return whether recovery must enter reconciliation instead of replanning."""
+
+        deployment = self.repository.get_deployment(self.config.deployment.deployment_id)
+        if deployment is None:
+            return False
+        decision = self.repository.pending_decision_for_date(
+            str(deployment["deployment_id"]), execution_date
+        )
+        if decision is None:
+            return False
+        return bool(self.repository.list_order_intents_for_decision(str(decision["decision_id"])))
 
     def startup_reconcile(
         self,
@@ -466,14 +528,19 @@ class LiveDailyJobs:
             trigger_source,
             lambda: self._startup_reconcile(trade_date),
             lock_connection,
+            deduplicate=False,
         )
 
     def _startup_reconcile(self, trade_date: date) -> Mapping[str, object]:
+        self._require_current_trade_date(trade_date)
         account_id = self.config.deployment.account_id()
         configured = self.repository.get_deployment(self.config.deployment.deployment_id)
-        current = self.repository.get_active_deployment_for_account(account_id)
         asset, positions, orders, trades = self._account_facts(require_trades=True)
         if asset.account_id != account_id:
+            if configured is not None:
+                self.repository.pause_deployment(
+                    str(configured["deployment_id"]), "ACCOUNT_ID_MISMATCH"
+                )
             raise ValueError("broker account_id does not match configured account")
         report = self.reconciliation.reconcile(
             account_id=account_id,
@@ -481,13 +548,22 @@ class LiveDailyJobs:
             broker_trades=trades,
             repository=self.repository,
         )
-        if report.has_unresolved or any(order.status.is_active for order in orders):
-            raise RuntimeError("startup reconciliation has active or unresolved orders")
-        if configured is not None and _status(
-            configured["status"], DeploymentStatus
-        ) is DeploymentStatus.RETIRED:
+        if report.has_unresolved:
+            if configured is not None:
+                self.repository.pause_deployment(
+                    str(configured["deployment_id"]), "STARTUP_RECONCILIATION_UNRESOLVED"
+                )
+            raise RuntimeError("startup reconciliation has unresolved broker facts")
+        if (
+            configured is not None
+            and _status(configured["status"], DeploymentStatus) is DeploymentStatus.RETIRED
+        ):
             raise RuntimeError("RETIRED deployment requires a new deployment_id")
         frozen = None if configured is None else _symbols(configured)
+        if configured is not None:
+            # PLANNED rows found here belong to a previous Engine lifecycle. They are never
+            # submitted after recovery; the next scheduled signal must create a fresh decision.
+            self.repository.abandon_planned_intents(str(configured["deployment_id"]))
         spec = self.deployment_spec_factory(frozen)
         outside = [
             position.symbol
@@ -495,6 +571,10 @@ class LiveDailyJobs:
             if position.total_quantity != 0 and position.symbol not in spec.symbols
         ]
         if outside:
+            if configured is not None:
+                self.repository.pause_deployment(
+                    str(configured["deployment_id"]), "POSITION_OUTSIDE_FROZEN_UNIVERSE"
+                )
             raise RuntimeError(f"non-zero positions exist outside frozen Universe: {outside}")
         ensured = self.repository.ensure_deployment(
             deployment_id=spec.deployment_id,
@@ -511,12 +591,19 @@ class LiveDailyJobs:
             model_bundle_sha256=spec.model_bundle_sha256,
             model_id=spec.model_id,
         )
-        if configured is not None and _status(
-            configured["status"], DeploymentStatus
-        ) is DeploymentStatus.PAUSED:
+        if (
+            configured is not None
+            and _status(configured["status"], DeploymentStatus) is DeploymentStatus.PAUSED
+        ):
             self.repository.resume_deployment(spec.deployment_id)
             ensured = self.repository.get_deployment(spec.deployment_id) or ensured
-        del current, trade_date
+        self._save_account_facts(
+            deployment=ensured,
+            trade_date=trade_date,
+            snapshot_types=(SnapshotType.CURRENT,),
+            asset=asset,
+            positions=positions,
+        )
         return ensured
 
     def prepare_signal(
@@ -535,10 +622,19 @@ class LiveDailyJobs:
         )
 
     def _prepare_signal(self, signal_date: date) -> DailyDecisionResult:
+        now = self.clock().astimezone(MARKET_TIMEZONE)
+        local_time = now.time().replace(tzinfo=None)
+        if signal_date < now.date():
+            raise JobSkipped("STALE_SIGNAL_DATE")
+        if signal_date > now.date() or (
+            signal_date == now.date() and local_time < self.config.signal.run_time
+        ):
+            raise JobSkipped("SIGNAL_TIME_NOT_REACHED")
         deployment = self._active_deployment()
         self._require_no_unresolved()
         asset = self._single(self.broker.query_asset(), "asset")
         positions = self._records(self.broker.query_positions(), "positions")
+        self._validate_asset_positions(asset, positions)
         symbols = _symbols(deployment)
         account = adapt_broker_account(asset=asset, positions=positions, symbols=symbols)
         result = self.signal_evaluator.evaluate(
@@ -556,9 +652,7 @@ class LiveDailyJobs:
                 data_as_of=signal_date,
                 strategy_source_sha256=str(deployment["strategy_source_sha256"]),
                 model_id=(
-                    None
-                    if deployment.get("model_id") is None
-                    else str(deployment["model_id"])
+                    None if deployment.get("model_id") is None else str(deployment["model_id"])
                 ),
                 config_hash=str(deployment["config_hash"]),
                 connection=connection,
@@ -581,31 +675,46 @@ class LiveDailyJobs:
         lock_connection: Connection | None = None,
     ) -> tuple[Mapping[str, object], ...]:
         return self._run_job(
-            "execute_pending_target",
+            "rebalance",
             execution_date,
             trigger_source,
             lambda: self._execute_pending_target(execution_date),
             lock_connection,
         )
 
-    def _execute_pending_target(
-        self, execution_date: date
-    ) -> tuple[Mapping[str, object], ...]:
+    def _execute_pending_target(self, execution_date: date) -> tuple[Mapping[str, object], ...]:
+        now = self.clock().astimezone(MARKET_TIMEZONE)
+        local_time = now.time().replace(tzinfo=None)
+        if execution_date < now.date():
+            raise JobSkipped("STALE_EXECUTION_DATE")
+        if execution_date > now.date():
+            raise JobSkipped("FUTURE_EXECUTION_DATE")
         deployment = self._active_deployment()
         decision = self.repository.pending_decision_for_date(
             str(deployment["deployment_id"]), execution_date
         )
         if decision is None:
             return ()
+        decision_id = str(decision["decision_id"])
+        if self.repository.decision_has_intent_status(decision_id, OrderIntentStatus.ABANDONED):
+            raise JobSkipped("ABANDONED_STALE_INTENT")
+        existing_intents = self.repository.list_order_intents_for_decision(decision_id)
+        if existing_intents:
+            # Any persisted execution activity means this decision has already crossed the
+            # planning boundary. Recovery may query/cancel/reconcile it, but never plans a
+            # second batch and never submits a second intent for the same economic action.
+            return self._finalize_rebalance(execution_date, deployment, tuple(existing_intents))
+        if local_time < self.config.execution.submit_start:
+            raise JobSkipped("REBALANCE_TIME_NOT_REACHED")
+        if local_time >= self.config.execution.stop_new_orders:
+            raise JobSkipped("MISSED_ORDER_WINDOW")
         weights = self.repository.load_target_positions(str(decision["decision_id"]))
         symbols = _symbols(deployment)
         asset, positions, orders, trades = self._account_facts(require_trades=True)
         self._reconcile_or_pause(deployment, orders, trades)
         quotes = {
             quote.symbol: quote
-            for quote in self._records(
-                self.quote_provider.latest_quotes(symbols), "quotes"
-            )
+            for quote in self._records(self.quote_provider.latest_quotes(symbols), "quotes")
         }
         valuation: dict[str, Decimal] = {}
         buy_limits: dict[str, Decimal] = {}
@@ -640,7 +749,7 @@ class LiveDailyJobs:
         position_map = {position.symbol: position for position in positions}
         preview = self.planner.plan(
             deployment_id=str(deployment["deployment_id"]),
-            decision_id=str(decision["decision_id"]),
+            decision_id=decision_id,
             execution_date=execution_date,
             symbols=symbols,
             target=target,
@@ -661,7 +770,7 @@ class LiveDailyJobs:
         }
         intents = self.planner.plan(
             deployment_id=str(deployment["deployment_id"]),
-            decision_id=str(decision["decision_id"]),
+            decision_id=decision_id,
             execution_date=execution_date,
             symbols=symbols,
             target=target,
@@ -713,10 +822,63 @@ class LiveDailyJobs:
                     )
                     raise
             saved_rows.append(self.repository.get_intent(str(saved["intent_id"])) or saved)
-        final_orders = self._records(self.broker.query_orders(), "orders")
-        final_trades = self._records(self.broker.query_trades(), "trades")
-        self._reconcile_or_pause(deployment, final_orders, final_trades)
-        return tuple(saved_rows)
+        return self._finalize_rebalance(execution_date, deployment, tuple(saved_rows))
+
+    def _finalize_rebalance(
+        self,
+        execution_date: date,
+        deployment: Mapping[str, object],
+        intent_rows: tuple[Mapping[str, object], ...],
+    ) -> tuple[Mapping[str, object], ...]:
+        now = self.clock().astimezone(MARKET_TIMEZONE)
+        wait_seconds = max(
+            0.0,
+            (
+                datetime.combine(
+                    execution_date,
+                    self.config.execution.cancel_open_orders,
+                    MARKET_TIMEZONE,
+                )
+                - now
+            ).total_seconds(),
+        )
+        deadline = time_module.monotonic() + wait_seconds
+        poll_seconds = float(self.config.miniqmt.reconnect_interval_seconds)
+        poll_limit = max(1, int(wait_seconds // poll_seconds) + 2)
+
+        for poll_number in range(poll_limit):
+            orders = self._records(self.broker.query_orders(), "orders")
+            trades = self._records(self.broker.query_trades(), "trades")
+            report = self._reconcile_or_pause(deployment, orders, trades)
+            if not report.active_broker_order_ids:
+                break
+            remaining = deadline - time_module.monotonic()
+            if remaining <= 0 or poll_number + 1 >= poll_limit:
+                self._cancel_open_orders()
+                break
+            self.sleep(min(poll_seconds, remaining))
+
+        final_asset, final_positions, final_orders, final_trades = self._account_facts(
+            require_trades=True
+        )
+        final_report = self._reconcile_or_pause(deployment, final_orders, final_trades)
+        if final_report.active_broker_order_ids:
+            self.repository.pause_deployment(
+                str(deployment["deployment_id"]), "ACTIVE_ORDER_AFTER_CANCEL"
+            )
+            raise RuntimeError("rebalance ended with active broker orders")
+        if final_report.has_incomplete:
+            self.repository.pause_deployment(
+                str(deployment["deployment_id"]), "INCOMPLETE_REBALANCE"
+            )
+        self._save_account_facts(
+            deployment=deployment,
+            trade_date=execution_date,
+            snapshot_types=(SnapshotType.CURRENT,),
+            asset=final_asset,
+            positions=final_positions,
+        )
+        return intent_rows
 
     def _submit_intent(self, intent: OrderIntent, intent_id: str, account_id: str) -> None:
         self.repository.mark_intent_submitting(intent_id)
@@ -761,9 +923,16 @@ class LiveDailyJobs:
             "cancel_open_orders",
             trade_date,
             trigger_source,
-            self._cancel_open_orders,
+            lambda: self._cancel_open_orders_for_date(trade_date),
             lock_connection,
         )
+
+    def _cancel_open_orders_for_date(self, trade_date: date) -> None:
+        self._require_current_trade_date(trade_date)
+        self._require_time_at_or_after(
+            self.config.execution.cancel_open_orders, "CANCEL_TIME_NOT_REACHED"
+        )
+        self._cancel_open_orders()
 
     def _cancel_open_orders(self) -> None:
         deployment = self._active_deployment()
@@ -782,9 +951,7 @@ class LiveDailyJobs:
                 intent = self.repository.get_intent_by_remark_token(
                     order.remark_token, account_id=account_id
                 )
-            if intent is None or str(intent["deployment_id"]) != str(
-                deployment["deployment_id"]
-            ):
+            if intent is None or str(intent["deployment_id"]) != str(deployment["deployment_id"]):
                 unknown.append(order.broker_order_id)
             else:
                 associated.append(order)
@@ -810,19 +977,33 @@ class LiveDailyJobs:
             "reconcile_eod",
             trade_date,
             trigger_source,
-            self._reconcile_eod,
+            lambda: self._reconcile_eod(trade_date),
             lock_connection,
         )
 
-    def _reconcile_eod(self) -> ReconciliationReport:
+    def eod(
+        self,
+        trade_date: date,
+        *,
+        trigger_source: JobTriggerSource = JobTriggerSource.MANUAL,
+        lock_connection: Connection | None = None,
+    ) -> ReconciliationReport:
+        return self._run_job(
+            "eod",
+            trade_date,
+            trigger_source,
+            lambda: self._eod(trade_date),
+            lock_connection,
+        )
+
+    def _eod(self, trade_date: date) -> ReconciliationReport:
+        self._require_current_trade_date(trade_date)
+        self._require_time_at_or_after(self.config.eod.run_time, "EOD_TIME_NOT_REACHED")
         deployment = self._active_deployment(allow_paused=True)
         try:
-            orders = self._records(self.broker.query_orders(), "orders")
-            trades = self._records(self.broker.query_trades(), "trades")
+            asset, positions, orders, trades = self._account_facts(require_trades=True)
         except Exception:
-            self.repository.pause_deployment(
-                str(deployment["deployment_id"]), "EOD_QUERY_FAILED"
-            )
+            self.repository.pause_deployment(str(deployment["deployment_id"]), "EOD_QUERY_FAILED")
             raise
         report = self.reconciliation.reconcile(
             account_id=self.config.deployment.account_id(),
@@ -830,10 +1011,40 @@ class LiveDailyJobs:
             broker_trades=trades,
             repository=self.repository,
         )
-        if report.has_unresolved:
+        if report.has_unresolved or report.active_broker_order_ids:
+            self.repository.pause_deployment(str(deployment["deployment_id"]), "EOD_UNRESOLVED")
+            raise RuntimeError("end-of-day reconciliation is unresolved")
+        if report.has_incomplete:
             self.repository.pause_deployment(
-                str(deployment["deployment_id"]), "EOD_UNRESOLVED"
+                str(deployment["deployment_id"]), "INCOMPLETE_REBALANCE"
             )
+        self._save_account_facts(
+            deployment=deployment,
+            trade_date=trade_date,
+            snapshot_types=(SnapshotType.CURRENT, SnapshotType.EOD),
+            asset=asset,
+            positions=positions,
+        )
+        return report
+
+    def _reconcile_eod(self, trade_date: date | None = None) -> ReconciliationReport:
+        self._require_current_trade_date(trade_date or self.clock().date())
+        self._require_time_at_or_after(self.config.eod.run_time, "EOD_TIME_NOT_REACHED")
+        deployment = self._active_deployment(allow_paused=True)
+        try:
+            orders = self._records(self.broker.query_orders(), "orders")
+            trades = self._records(self.broker.query_trades(), "trades")
+        except Exception:
+            self.repository.pause_deployment(str(deployment["deployment_id"]), "EOD_QUERY_FAILED")
+            raise
+        report = self.reconciliation.reconcile(
+            account_id=self.config.deployment.account_id(),
+            broker_orders=orders,
+            broker_trades=trades,
+            repository=self.repository,
+        )
+        if report.has_unresolved or report.active_broker_order_ids:
+            self.repository.pause_deployment(str(deployment["deployment_id"]), "EOD_UNRESOLVED")
             raise RuntimeError("end-of-day reconciliation is unresolved")
         return report
 
@@ -853,9 +1064,19 @@ class LiveDailyJobs:
         )
 
     def _snapshot_eod(self, trade_date: date) -> None:
-        deployment = self._active_deployment(allow_paused=True)
-        asset = self._single(self.broker.query_asset(), "asset")
-        positions = self._records(self.broker.query_positions(), "positions")
+        # Keep the historical CLI command, but route it through the same authoritative
+        # query/reconcile boundary as the scheduled EOD business job.
+        self._eod(trade_date)
+
+    def _save_account_facts(
+        self,
+        *,
+        deployment: Mapping[str, object],
+        trade_date: date,
+        snapshot_types: tuple[SnapshotType, ...],
+        asset: BrokerAssetSnapshot,
+        positions: Sequence[BrokerPositionSnapshot],
+    ) -> None:
         adapted = adapt_broker_account(
             asset=asset, positions=positions, symbols=_symbols(deployment)
         )
@@ -863,22 +1084,8 @@ class LiveDailyJobs:
             (position.market_value for position in adapted.positions_by_symbol.values()),
             Decimal("0"),
         )
-        frozen_cash = max(
-            Decimal("0"), asset.total_asset - asset.available_cash - market_value
-        )
+        frozen_cash = max(Decimal("0"), asset.total_asset - asset.available_cash - market_value)
         with self.repository.transaction() as connection:
-            self.repository.save_account_snapshot(
-                deployment_id=str(deployment["deployment_id"]),
-                trade_date=trade_date,
-                snapshot_type=SnapshotType.EOD,
-                captured_at=asset.captured_at,
-                cash=asset.available_cash,
-                available_cash=asset.available_cash,
-                market_value=market_value,
-                total_asset=asset.total_asset,
-                frozen_cash=frozen_cash,
-                connection=connection,
-            )
             rows = []
             for symbol in _symbols(deployment):
                 position = adapted.positions_by_symbol[symbol]
@@ -892,19 +1099,31 @@ class LiveDailyJobs:
                         "symbol": symbol,
                         "total_quantity": position.total_quantity,
                         "available_quantity": position.available_quantity,
-                        "frozen_quantity": position.total_quantity
-                        - position.available_quantity,
+                        "frozen_quantity": position.total_quantity - position.available_quantity,
                         "market_value": position.market_value,
                         "last_price": last_price,
                     }
                 )
-            self.repository.save_position_snapshots(
-                deployment_id=str(deployment["deployment_id"]),
-                trade_date=trade_date,
-                snapshot_type=SnapshotType.EOD,
-                positions=rows,
-                connection=connection,
-            )
+            for snapshot_type in snapshot_types:
+                self.repository.save_account_snapshot(
+                    deployment_id=str(deployment["deployment_id"]),
+                    trade_date=trade_date,
+                    snapshot_type=snapshot_type,
+                    captured_at=asset.captured_at,
+                    cash=asset.available_cash,
+                    available_cash=asset.available_cash,
+                    market_value=market_value,
+                    total_asset=asset.total_asset,
+                    frozen_cash=frozen_cash,
+                    connection=connection,
+                )
+                self.repository.save_position_snapshots(
+                    deployment_id=str(deployment["deployment_id"]),
+                    trade_date=trade_date,
+                    snapshot_type=snapshot_type,
+                    positions=rows,
+                    connection=connection,
+                )
 
     def _active_deployment(self, *, allow_paused: bool = False) -> Mapping[str, object]:
         deployment = self.repository.get_deployment(self.config.deployment.deployment_id)
@@ -952,7 +1171,31 @@ class LiveDailyJobs:
         positions = self._records(self.broker.query_positions(), "positions")
         orders = self._records(self.broker.query_orders(), "orders")
         trades = self._records(self.broker.query_trades(), "trades") if require_trades else ()
+        self._validate_asset_positions(asset, positions)
         return asset, positions, orders, trades
+
+    def _validate_asset_positions(
+        self,
+        asset: BrokerAssetSnapshot,
+        positions: Sequence[BrokerPositionSnapshot],
+    ) -> None:
+        account_id = self.config.deployment.account_id()
+        if asset.account_id not in {None, account_id}:
+            raise RuntimeError("broker asset belongs to a different account")
+        if any(position.account_id not in {None, account_id} for position in positions):
+            raise RuntimeError("broker positions include a different account")
+
+    def _require_current_trade_date(self, trade_date: date) -> None:
+        current = self.clock().astimezone(MARKET_TIMEZONE).date()
+        if trade_date < current:
+            raise JobSkipped("STALE_TRADE_DATE")
+        if trade_date > current:
+            raise JobSkipped("FUTURE_TRADE_DATE")
+
+    def _require_time_at_or_after(self, run_time: time, reason: str) -> None:
+        current = self.clock().astimezone(MARKET_TIMEZONE).time().replace(tzinfo=None)
+        if current < run_time:
+            raise JobSkipped(reason)
 
     @staticmethod
     def _records(result: QueryResult[ResultT], label: str) -> tuple[ResultT, ...]:
@@ -987,6 +1230,8 @@ class _BorrowedConnection:
 
 __all__ = [
     "DeploymentSpec",
+    "JobAlreadySucceeded",
+    "JobSkipped",
     "LiveDailyJobs",
     "ModelDeploymentSpecFactory",
     "ModelSignalService",

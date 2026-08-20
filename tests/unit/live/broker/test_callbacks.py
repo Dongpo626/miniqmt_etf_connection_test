@@ -115,7 +115,9 @@ def test_consumer_persists_single_order_and_trade_and_stops_on_unhealthy() -> No
             status=3,
         )
     )
+    consumer.process(BrokerEvent(BrokerEventType.ORDER_ERROR, error="rejected"))
+    consumer.process(BrokerEvent(BrokerEventType.CANCEL_ERROR, error="cancel failed"))
 
     repository.bind_broker_order.assert_called_once()
     repository.insert_broker_trade_if_absent.assert_called_once()
-    assert unhealthy.call_count == 2
+    assert unhealthy.call_count == 4
